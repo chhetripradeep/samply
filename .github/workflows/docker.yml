@@ -43,5 +43,5 @@ jobs:
           DOCKER_IMAGE: chhetripradeep/samply
         run: |
           docker buildx create --use --name=samply-builder
-          docker buildx build --file=Dockerfile --output="type=registry" --platform=linux/amd64,linux/arm64,linux/arm/v7 --tag $DOCKER_IMAGE .
+          docker buildx build --file=Dockerfile --output="type=registry" --platform=linux/amd64,linux/arm64 --tag $DOCKER_IMAGE .
           docker buildx rm samply-builder
