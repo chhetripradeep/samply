@@ -10,6 +10,6 @@ FROM debian:bookworm-slim
 
 WORKDIR /app
 
-COPY --from=build /app/target/release/samply /app/samply
+COPY --from=build /app/target/release /app
 
-CMD ["/app/samply"]
+CMD ["/app/release/samply"]
