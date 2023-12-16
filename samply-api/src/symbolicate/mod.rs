@@ -2,6 +2,7 @@ use crate::to_debug_id;
 use crate::{api_file_path::to_api_file_path, error::Error};
 use samply_symbols::{FileAndPathHelper, FramesLookupResult, LibraryInfo, SymbolManager};
 use std::collections::HashMap;
+use std::num::NonZeroU32;
 
 pub mod looked_up_addresses;
 pub mod request_json;
@@ -142,7 +143,7 @@ fn gather_requested_addresses(
             for frame in &stack.0 {
                 requested_addresses_by_module_index
                     .entry(frame.module_index)
-                    .or_insert_with(Vec::new)
+                    .or_default()
                     .push(frame.address);
             }
         }
@@ -152,7 +153,7 @@ fn gather_requested_addresses(
             )?;
             requested_addresses
                 .entry((*lib).clone())
-                .or_insert_with(Vec::new)
+                .or_default()
                 .extend(addresses);
         }
     }
@@ -240,13 +241,13 @@ fn create_response(
                                 .expect("inline_frames should always have at least one element");
                             DebugInfo {
                                 file: outer.file_path.as_ref().map(to_api_file_path),
-                                line: outer.line_number,
+                                line: outer.line_number.and_then(NonZeroU32::new),
                                 inlines: inlines
                                     .iter()
                                     .map(|inline_frame| FrameDebugInfo {
                                         function: inline_frame.function.clone(),
                                         file: inline_frame.file_path.as_ref().map(to_api_file_path),
-                                        line: inline_frame.line_number,
+                                        line: inline_frame.line_number.and_then(NonZeroU32::new),
                                     })
                                     .collect(),
                             }

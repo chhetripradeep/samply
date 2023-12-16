@@ -242,6 +242,7 @@ impl InstructionDecoding for yaxpeax_x86::amd64::Arch {
                     | Opcode::JGE
                     | Opcode::JLE
                     | Opcode::JG
+                    | Opcode::CALL
             )
         }
 
@@ -406,7 +407,9 @@ where
                 });
 
                 offset += A::ADJUST_BY_AFTER_ERROR as u32;
-                let Some(reader_bytes) = bytes.get(offset as usize..) else { break };
+                let Some(reader_bytes) = bytes.get(offset as usize..) else {
+                    break;
+                };
                 reader = U8Reader::new(reader_bytes);
             }
         }

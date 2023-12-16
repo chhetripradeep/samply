@@ -21,7 +21,7 @@ use super::proc_maps;
 use super::process::SuspendedLaunchedProcess;
 use crate::linux_shared::{ConvertRegs, Converter, EventInterpretation, MmapRangeOrVec};
 use crate::server::{start_server_main, ServerProps};
-use crate::ConversionArgs;
+use crate::shared::recording_props::{ConversionProps, RecordingProps};
 
 #[cfg(target_arch = "x86_64")]
 pub type ConvertRegsNative = crate::linux_shared::ConvertRegsX86_64;
@@ -31,18 +31,18 @@ pub type ConvertRegsNative = crate::linux_shared::ConvertRegsAarch64;
 
 #[allow(clippy::too_many_arguments)]
 pub fn start_recording(
-    output_file: &Path,
     command_name: OsString,
     command_args: &[OsString],
-    time_limit: Option<Duration>,
-    interval: Duration,
-    server_props: Option<ServerProps>,
-    conversion_args: &ConversionArgs,
     iteration_count: u32,
+    recording_props: RecordingProps,
+    conversion_props: ConversionProps,
+    server_props: Option<ServerProps>,
 ) -> Result<ExitStatus, ()> {
-    // Ignore SIGINT while the subcommand is running. The signal still reaches the process
-    // under observation while we continue to record it. (ctrl+c will send the SIGINT signal
-    // to all processes in the foreground process group).
+    // We want to profile a child process which we are about to launch.
+
+    // Ignore SIGINT in our process while the child process is running. The
+    // signal will still reach the child process, because Ctrl+C sends the
+    // SIGINT signal to all processes in the foreground process group.
     let should_terminate_on_ctrl_c = Arc::new(AtomicBool::new(false));
     #[cfg(unix)]
     signal_hook::flag::register_conditional_default(
@@ -65,18 +65,18 @@ pub fn start_recording(
         crossbeam_channel::bounded(2);
 
     // Launch the observer thread. This thread will manage the perf events.
-    let output_file_copy = output_file.to_owned();
-    let command_name_copy = command_name.to_string_lossy().to_string();
-    let conversion_args = conversion_args.clone();
+    let output_file_copy = recording_props.output_file.clone();
+    let interval = recording_props.interval;
+    let time_limit = recording_props.time_limit;
     let observer_thread = thread::spawn(move || {
-        let product = command_name_copy;
-        let mut converter = make_converter(interval, &product, &conversion_args);
+        let mut converter = make_converter(interval, conversion_props);
 
         // Wait for the initial pid to profile.
         let SamplerRequest::StartProfilingAnotherProcess(pid, attach_mode) =
-            profile_another_pid_request_receiver.recv().unwrap() else {
-                panic!("The first message should be a StartProfilingAnotherProcess")
-            };
+            profile_another_pid_request_receiver.recv().unwrap()
+        else {
+            panic!("The first message should be a StartProfilingAnotherProcess")
+        };
 
         // Create the perf events, setting ENABLE_ON_EXEC.
         let perf_group = init_profiler(interval, pid, attach_mode, &mut converter);
@@ -183,19 +183,17 @@ pub fn start_recording(
         .expect("couldn't join observer thread");
 
     if let Some(server_props) = server_props {
-        start_server_main(output_file, server_props);
+        start_server_main(&recording_props.output_file, server_props);
     }
 
     Ok(exit_status)
 }
 
 pub fn start_profiling_pid(
-    output_file: &Path,
     pid: u32,
-    time_limit: Option<Duration>,
-    interval: Duration,
+    recording_props: RecordingProps,
+    conversion_props: ConversionProps,
     server_props: Option<ServerProps>,
-    conversion_args: &ConversionArgs,
 ) {
     // When the first Ctrl+C is received, stop recording.
     // The server launches after the recording finishes. On the second Ctrl+C, terminate the server.
@@ -214,26 +212,28 @@ pub fn start_profiling_pid(
     let (profile_another_pid_reply_sender, profile_another_pid_reply_receiver) =
         crossbeam_channel::bounded(2);
 
-    let output_file_copy = output_file.to_owned();
-    let product = format!("PID {pid}");
-    let conversion_args = conversion_args.clone();
+    let output_file = recording_props.output_file.clone();
     let observer_thread = thread::spawn({
         let stop = stop.clone();
         move || {
-            let mut converter = make_converter(interval, &product, &conversion_args);
+            let interval = recording_props.interval;
+            let time_limit = recording_props.time_limit;
+            let mut converter = make_converter(interval, conversion_props);
             let SamplerRequest::StartProfilingAnotherProcess(pid, attach_mode) =
-                profile_another_pid_request_receiver.recv().unwrap() else {
-                    panic!("The first message should be a StartProfilingAnotherProcess")
-                };
+                profile_another_pid_request_receiver.recv().unwrap()
+            else {
+                panic!("The first message should be a StartProfilingAnotherProcess")
+            };
             let perf_group = init_profiler(interval, pid, attach_mode, &mut converter);
 
             // Tell the main thread that we are now executing.
             profile_another_pid_reply_sender.send(true).unwrap();
 
+            let output_file = recording_props.output_file;
             run_profiler(
                 perf_group,
                 converter,
-                &output_file_copy,
+                &output_file,
                 time_limit,
                 profile_another_pid_request_receiver,
                 profile_another_pid_reply_sender,
@@ -272,7 +272,7 @@ pub fn start_profiling_pid(
     stop.store(true, Ordering::SeqCst);
 
     if let Some(server_props) = server_props {
-        start_server_main(output_file, server_props);
+        start_server_main(&output_file, server_props);
     }
 }
 
@@ -284,8 +284,7 @@ fn paranoia_level() -> Option<u32> {
 
 fn make_converter(
     interval: Duration,
-    product_name: &str,
-    conversion_args: &ConversionArgs,
+    conversion_props: ConversionProps,
 ) -> Converter<framehop::UnwinderNative<MmapRangeOrVec, framehop::MayAllocateDuringUnwind>> {
     let interval_nanos = if interval.as_nanos() > 0 {
         interval.as_nanos() as u64
@@ -312,7 +311,7 @@ fn make_converter(
     };
 
     Converter::<framehop::UnwinderNative<MmapRangeOrVec, framehop::MayAllocateDuringUnwind>>::new(
-        product_name,
+        &conversion_props.profile_name,
         None,
         HashMap::new(),
         machine_info.as_ref().map(|info| info.release.as_str()),
@@ -321,8 +320,8 @@ fn make_converter(
         framehop::CacheNative::new(),
         None,
         interpretation,
-        conversion_args.merge_threads,
-        conversion_args.fold_recursive_prefix,
+        conversion_props.merge_threads,
+        conversion_props.fold_recursive_prefix,
     )
 }
 
@@ -353,11 +352,10 @@ fn init_profiler(
         attach_mode,
     );
 
-    let mut perf = match perf {
-        Ok(perf) => perf,
-        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-            match paranoia_level() {
-                Some(level) if level > 1 => {
+    if let Err(error) = &perf {
+        if error.kind() == std::io::ErrorKind::PermissionDenied {
+            if let Some(level) = paranoia_level() {
+                if level > 1 {
                     eprintln!();
                     eprintln!(
                         "'/proc/sys/kernel/perf_event_paranoid' is currently set to {level}."
@@ -369,32 +367,34 @@ fn init_profiler(
                     eprintln!();
                     std::process::exit(1);
                 }
-                _ => {
-                    // Permission denied even though parania was probably not the reason.
-                    // Another reason for the error could be the type of perf event:
-                    // The "Hardware CPU cycles" event is not supported in some contexts, for example in VMs.
-                    // Try a different event type.
-                    let perf = PerfGroup::open(
-                        pid,
-                        frequency,
-                        stack_size,
-                        EventSource::SwCpuClock,
-                        regs_mask,
-                        attach_mode,
-                    );
-                    match perf {
-                        Ok(perf) => perf, // Success!
-                        Err(error) => {
-                            eprintln!("Failed to start profiling: {error}");
-                            std::process::exit(1);
-                        }
-                    }
-                }
             }
         }
-        Err(error) => {
-            eprintln!("Failed to start profiling: {error}");
-            std::process::exit(1);
+    }
+
+    let mut perf = match perf {
+        Ok(perf) => perf,
+        Err(_) => {
+            // We've already checked for permission denied due to paranoia
+            // level, and exited with a warning in that case.
+
+            // Another reason for the error could be the type of perf event:
+            // The "Hardware CPU cycles" event is not supported in some contexts, for example in VMs.
+            // Try a different event type.
+            let perf = PerfGroup::open(
+                pid,
+                frequency,
+                stack_size,
+                EventSource::SwCpuClock,
+                regs_mask,
+                attach_mode,
+            );
+            match perf {
+                Ok(perf) => perf, // Success!
+                Err(error) => {
+                    eprintln!("Failed to start profiling: {error}");
+                    std::process::exit(1);
+                }
+            }
         }
     };
 

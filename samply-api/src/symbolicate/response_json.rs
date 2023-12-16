@@ -1,6 +1,6 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, num::NonZeroU32};
 
-use serde::Serialize;
+use serde_derive::Serialize;
 
 #[derive(Serialize, Debug)]
 pub struct Response {
@@ -56,7 +56,7 @@ pub struct DebugInfo {
     pub file: Option<String>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub line: Option<u32>,
+    pub line: Option<NonZeroU32>,
 
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub inlines: Vec<FrameDebugInfo>,
@@ -71,7 +71,7 @@ pub struct FrameDebugInfo {
     pub file: Option<String>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub line: Option<u32>,
+    pub line: Option<NonZeroU32>,
 }
 
 #[derive(Serialize, Debug)]

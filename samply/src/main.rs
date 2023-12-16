@@ -1,7 +1,7 @@
 #[cfg(target_os = "macos")]
 mod mac;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "android", target_os = "linux"))]
 mod linux;
 
 mod import;
@@ -10,17 +10,19 @@ mod server;
 mod shared;
 
 use clap::{Args, Parser, Subcommand};
+use shared::recording_props::{ConversionProps, RecordingProps};
 use tempfile::NamedTempFile;
 
 use std::fs::File;
 use std::io::{BufReader, BufWriter};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 // To avoid warnings about unused declarations
 #[cfg(target_os = "macos")]
 pub use mac::{kernel_error, thread_act, thread_info};
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "android", target_os = "linux"))]
 use linux::profiler;
 #[cfg(target_os = "macos")]
 use mac::profiler;
@@ -62,7 +64,7 @@ enum Action {
     /// Load a profile from a file and display it.
     Load(LoadArgs),
 
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(target_os = "android", target_os = "macos", target_os = "linux"))]
     /// Record a profile and display it.
     Record(RecordArgs),
 }
@@ -79,7 +81,7 @@ struct LoadArgs {
     server_args: ServerArgs,
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[allow(unused)]
 #[derive(Debug, Args)]
 struct RecordArgs {
     /// Do not run a local server after recording.
@@ -139,6 +141,11 @@ struct ServerArgs {
 
 #[derive(Debug, Args, Clone)]
 pub struct ConversionArgs {
+    /// Set a custom name for the recorded profile.
+    /// By default it is either the command that was run or the process pid.
+    #[arg(long)]
+    profile_name: Option<String>,
+
     /// Merge non-overlapping threads of the same name.
     #[arg(long)]
     merge_threads: bool,
@@ -159,8 +166,9 @@ fn main() {
                     std::process::exit(1)
                 }
             };
+            let conversion_props = load_args.conversion_props();
             let converted_temp_file =
-                attempt_conversion(&load_args.file, &input_file, &load_args.conversion_args);
+                attempt_conversion(&load_args.file, &input_file, conversion_props);
             let filename = match &converted_temp_file {
                 Some(temp_file) => temp_file.path(),
                 None => &load_args.file,
@@ -168,45 +176,27 @@ fn main() {
             start_server_main(filename, load_args.server_args.server_props());
         }
 
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        #[cfg(any(target_os = "android", target_os = "macos", target_os = "linux"))]
         Action::Record(record_args) => {
-            use std::time::Duration;
-
             let server_props = if record_args.save_only {
                 None
             } else {
                 Some(record_args.server_args.server_props())
             };
 
-            let time_limit = record_args.duration.map(Duration::from_secs_f64);
-            if record_args.rate <= 0.0 {
-                eprintln!(
-                    "Error: sampling rate must be greater than zero, got {}",
-                    record_args.rate
-                );
-                std::process::exit(1);
-            }
-            let interval = Duration::from_secs_f64(1.0 / record_args.rate);
+            let recording_props = record_args.recording_props();
+            let conversion_props = record_args.conversion_props();
 
             if let Some(pid) = record_args.pid {
-                profiler::start_profiling_pid(
-                    &record_args.output,
-                    pid,
-                    time_limit,
-                    interval,
-                    server_props,
-                    &record_args.conversion_args,
-                );
+                profiler::start_profiling_pid(pid, recording_props, conversion_props, server_props);
             } else {
                 let exit_status = match profiler::start_recording(
-                    &record_args.output,
                     record_args.command[0].clone(),
                     &record_args.command[1..],
-                    time_limit,
-                    interval,
-                    server_props,
-                    &record_args.conversion_args,
                     record_args.iteration_count,
+                    recording_props,
+                    conversion_props,
+                    server_props,
                 ) {
                     Ok(exit_status) => exit_status,
                     Err(err) => {
@@ -216,6 +206,57 @@ fn main() {
                 };
                 std::process::exit(exit_status.code().unwrap_or(0));
             }
+        }
+    }
+}
+
+impl LoadArgs {
+    fn conversion_props(&self) -> ConversionProps {
+        let profile_name = if let Some(profile_name) = &self.conversion_args.profile_name {
+            profile_name.clone()
+        } else {
+            "Imported perf profile".to_string()
+        };
+        ConversionProps {
+            profile_name,
+            merge_threads: self.conversion_args.merge_threads,
+            fold_recursive_prefix: self.conversion_args.fold_recursive_prefix,
+        }
+    }
+}
+
+impl RecordArgs {
+    #[allow(unused)]
+    pub fn recording_props(&self) -> RecordingProps {
+        let time_limit = self.duration.map(Duration::from_secs_f64);
+        if self.rate <= 0.0 {
+            eprintln!(
+                "Error: sampling rate must be greater than zero, got {}",
+                self.rate
+            );
+            std::process::exit(1);
+        }
+        let interval = Duration::from_secs_f64(1.0 / self.rate);
+
+        RecordingProps {
+            output_file: self.output.clone(),
+            time_limit,
+            interval,
+        }
+    }
+
+    #[allow(unused)]
+    pub fn conversion_props(&self) -> ConversionProps {
+        let profile_name = match (self.conversion_args.profile_name.clone(), self.pid, self.command.first()) {
+            (Some(profile_name), _, _) => profile_name,
+            (None, Some(pid), _) => format!("PID {pid}"),
+            (None, None, Some(command)) => command.to_string_lossy().to_string(),
+            (None, None, None) => panic!("Either pid or command is guaranteed to be present (clap should have done the validation)"),
+        };
+        ConversionProps {
+            profile_name,
+            merge_threads: self.conversion_args.merge_threads,
+            fold_recursive_prefix: self.conversion_args.fold_recursive_prefix,
         }
     }
 }
@@ -244,20 +285,14 @@ impl ServerArgs {
 fn attempt_conversion(
     filename: &Path,
     input_file: &File,
-    settings: &ConversionArgs,
+    conversion_props: ConversionProps,
 ) -> Option<NamedTempFile> {
     let path = Path::new(filename)
         .canonicalize()
         .expect("Couldn't form absolute path");
     let reader = BufReader::new(input_file);
     let output_file = tempfile::NamedTempFile::new().ok()?;
-    let profile = import::perf::convert(
-        reader,
-        path.parent(),
-        settings.merge_threads,
-        settings.fold_recursive_prefix,
-    )
-    .ok()?;
+    let profile = import::perf::convert(reader, path.parent(), conversion_props).ok()?;
     let writer = BufWriter::new(output_file.as_file());
     serde_json::to_writer(writer, &profile).ok()?;
     Some(output_file)
@@ -273,7 +308,7 @@ mod test {
         Opt::command().debug_assert();
     }
 
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(target_os = "android", target_os = "macos", target_os = "linux"))]
     #[test]
     fn verify_cli_record() {
         let opt = Opt::parse_from(["samply", "record", "rustup", "show"]);
