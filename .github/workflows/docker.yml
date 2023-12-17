@@ -40,7 +40,7 @@ jobs:
       - name: Build and Push Docker images
         env:
           DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
-          DOCKER_IMAGE: chhetripradeep/samply
+          DOCKER_IMAGE: chhetripradeep/samply:0.11.0
         run: |
           docker buildx create --use --name=samply-builder
           docker buildx build --file=Dockerfile --output="type=registry" --platform=linux/amd64,linux/arm64 --tag $DOCKER_IMAGE .
