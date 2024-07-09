@@ -1,68 +1,82 @@
-use crossbeam_channel::unbounded;
-use serde_json::to_writer;
-
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
-use std::ffi::OsString;
 use std::fs::File;
-use std::io::BufWriter;
 use std::process::ExitStatus;
-use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+use crossbeam_channel::unbounded;
+
 use super::error::SamplingError;
-use super::process_launcher::{MachError, ReceivedStuff, TaskAccepter};
-use super::sampler::{Sampler, TaskInit};
+use super::process_launcher::{
+    ExistingProcessRunner, MachError, ReceivedStuff, RootTaskRunner, TaskAccepter, TaskLauncher,
+};
+use super::sampler::{JitdumpOrMarkerPath, Sampler, TaskInit, TaskInitOrShutdown};
 use super::time::get_monotonic_timestamp;
 use crate::server::{start_server_main, ServerProps};
-use crate::shared::recording_props::{ConversionProps, RecordingProps};
-
-pub fn start_profiling_pid(
-    _pid: u32,
-    _recording_props: RecordingProps,
-    _conversion_props: ConversionProps,
-    _server_props: Option<ServerProps>,
-) {
-    eprintln!("Profiling existing processes is currently not supported on macOS.");
-    eprintln!("You can only profile processes which you launch via samply.");
-    std::process::exit(1)
-}
+use crate::shared::recording_props::{
+    ProcessLaunchProps, ProfileCreationProps, RecordingMode, RecordingProps,
+};
+use crate::shared::save_profile::save_profile_to_file;
+use crate::shared::symbol_props::SymbolProps;
 
 pub fn start_recording(
-    command_name: OsString,
-    command_args: &[OsString],
-    iteration_count: u32,
+    recording_mode: RecordingMode,
     recording_props: RecordingProps,
-    conversion_props: ConversionProps,
+    mut profile_creation_props: ProfileCreationProps,
+    symbol_props: SymbolProps,
     server_props: Option<ServerProps>,
 ) -> Result<ExitStatus, MachError> {
-    let (task_sender, task_receiver) = unbounded();
-    let command_name_copy = command_name.to_string_lossy().to_string();
     let output_file = recording_props.output_file.clone();
+
+    let mut task_accepter = TaskAccepter::new()?;
+
+    let root_task_runner: Box<dyn RootTaskRunner> = match recording_mode {
+        RecordingMode::All => {
+            eprintln!("Error: Profiling all processes is not supported on macOS.");
+            eprintln!("You can only profile processes which you launch via samply, or attach to via --pid.");
+            std::process::exit(1)
+        }
+        RecordingMode::Pid(pid) => Box::new(ExistingProcessRunner::new(pid, &mut task_accepter)),
+        RecordingMode::Launch(process_launch_props) => {
+            let ProcessLaunchProps {
+                mut env_vars,
+                command_name,
+                args,
+                iteration_count,
+            } = process_launch_props;
+
+            if profile_creation_props.coreclr.any_enabled() {
+                // We need to set DOTNET_PerfMapEnabled=2 in the environment if it's not already set.
+                // If we set it, we'll also set unlink_aux_files=true to avoid leaving files
+                // behind in the temp directory. But if it's set manually, assume the user
+                // knows what they're doing and will specify the arg as needed.
+                if !env_vars.iter().any(|p| p.0 == "DOTNET_PerfMapEnabled") {
+                    env_vars.push(("DOTNET_PerfMapEnabled".into(), "2".into()));
+                    profile_creation_props.unlink_aux_files = true;
+                }
+            }
+
+            let task_launcher = TaskLauncher::new(
+                &command_name,
+                &args,
+                iteration_count,
+                &env_vars,
+                task_accepter.extra_env_vars(),
+            )?;
+
+            Box::new(task_launcher)
+        }
+    };
+
+    let unstable_presymbolicate = profile_creation_props.unstable_presymbolicate;
+
+    let (task_sender, task_receiver) = unbounded();
+
     let sampler_thread = thread::spawn(move || {
-        let sampler = Sampler::new(
-            command_name_copy,
-            task_receiver,
-            recording_props,
-            conversion_props,
-        );
+        let sampler = Sampler::new(task_receiver, recording_props, profile_creation_props);
         sampler.run()
     });
-
-    // Ignore SIGINT while the subcommand is running. The signal still reaches the process
-    // under observation while we continue to record it. (ctrl+c will send the SIGINT signal
-    // to all processes in the foreground process group).
-    let should_terminate_on_ctrl_c = Arc::new(AtomicBool::new(false));
-    #[cfg(unix)]
-    signal_hook::flag::register_conditional_default(
-        signal_hook::consts::SIGINT,
-        should_terminate_on_ctrl_c.clone(),
-    )
-    .expect("cannot register signal handler");
-
-    let (mut task_accepter, task_launcher) = TaskAccepter::new(&command_name, command_args)?;
 
     let (accepter_sender, accepter_receiver) = unbounded();
     let accepter_thread = thread::spawn(move || {
@@ -71,33 +85,35 @@ pub fn start_recording(
         // A map of pids to channel senders, to notify existing tasks of Jitdump
         // paths. Having the mapping here lets us deliver the path to the right
         // task even in cases where a process execs into a new task with the same pid.
-        let mut jitdump_path_senders_per_pid = HashMap::new();
+        let mut path_senders_per_pid = HashMap::new();
 
         loop {
             if let Ok(()) = accepter_receiver.try_recv() {
+                task_sender.send(TaskInitOrShutdown::Shutdown).ok();
                 break;
             }
             let timeout = Duration::from_secs_f64(1.0);
             match task_accepter.next_message(timeout) {
-                Ok(ReceivedStuff::AcceptedTask(mut accepted_task)) => {
+                Ok(ReceivedStuff::AcceptedTask(accepted_task)) => {
                     let pid = accepted_task.get_id();
-                    let (jitdump_path_sender, jitdump_path_receiver) = unbounded();
-                    let send_result = task_sender.send(TaskInit {
+                    let (path_sender, path_receiver) = unbounded();
+                    let send_result = task_sender.send(TaskInitOrShutdown::TaskInit(TaskInit {
                         start_time_mono: get_monotonic_timestamp(),
-                        task: accepted_task.take_task(),
+                        task: accepted_task.task(),
                         pid,
-                        jitdump_path_receiver,
-                    });
-                    jitdump_path_senders_per_pid.insert(pid, jitdump_path_sender);
+                        path_receiver,
+                    }));
+                    path_senders_per_pid.insert(pid, path_sender);
                     if send_result.is_err() {
                         // The sampler has already shut down. This task arrived too late.
                     }
                     accepted_task.start_execution();
                 }
                 Ok(ReceivedStuff::JitdumpPath(pid, path)) => {
-                    match jitdump_path_senders_per_pid.entry(pid) {
+                    match path_senders_per_pid.entry(pid) {
                         Entry::Occupied(mut entry) => {
-                            let send_result = entry.get_mut().send(path);
+                            let send_result =
+                                entry.get_mut().send(JitdumpOrMarkerPath::JitdumpPath(path));
                             if send_result.is_err() {
                                 // The task is probably already dead. The path arrived too late.
                                 entry.remove();
@@ -106,6 +122,24 @@ pub fn start_recording(
                         Entry::Vacant(_entry) => {
                             eprintln!(
                                 "Received a Jitdump path for pid {pid} which I don't have a task for."
+                            );
+                        }
+                    }
+                }
+                Ok(ReceivedStuff::MarkerFilePath(pid, path)) => {
+                    match path_senders_per_pid.entry(pid) {
+                        Entry::Occupied(mut entry) => {
+                            let send_result = entry
+                                .get_mut()
+                                .send(JitdumpOrMarkerPath::MarkerFilePath(path));
+                            if send_result.is_err() {
+                                // The task is probably already dead. The path arrived too late.
+                                entry.remove();
+                            }
+                        }
+                        Entry::Vacant(_entry) => {
+                            eprintln!(
+                                "Received a marker file path for pid {pid} which I don't have a task for."
                             );
                         }
                     }
@@ -120,24 +154,8 @@ pub fn start_recording(
         }
     });
 
-    let mut root_child = task_launcher.launch_child();
-    let mut exit_status = root_child.wait().expect("couldn't wait for child");
-
-    for i in 2..=iteration_count {
-        if !exit_status.success() {
-            eprintln!(
-                "Skipping remaining iterations due to non-success exit status: \"{}\"",
-                exit_status
-            );
-            break;
-        }
-        eprintln!("Running iteration {i} of {iteration_count}...");
-        let mut root_child = task_launcher.launch_child();
-        exit_status = root_child.wait().expect("couldn't wait for child");
-    }
-
-    // The launched subprocess is done. From now on, we want to terminate if the user presses Ctrl+C.
-    should_terminate_on_ctrl_c.store(true, std::sync::atomic::Ordering::SeqCst);
+    // Run the root task: either launch or attach to existing pid
+    let exit_status = root_task_runner.run_root_task()?;
 
     accepter_sender
         .send(())
@@ -166,12 +184,23 @@ pub fn start_recording(
         }
     };
 
-    let file = File::create(&output_file).unwrap();
-    let writer = BufWriter::new(file);
-    to_writer(writer, &profile).expect("Couldn't write JSON");
+    save_profile_to_file(&profile, &output_file).expect("Couldn't write JSON");
+
+    if unstable_presymbolicate {
+        crate::shared::symbol_precog::presymbolicate(
+            &profile,
+            &output_file.with_extension("syms.json"),
+        );
+    }
 
     if let Some(server_props) = server_props {
-        start_server_main(&output_file, server_props);
+        let libinfo_map = crate::profile_json_preparse::parse_libinfo_map_from_profile_file(
+            File::open(&output_file).expect("Couldn't open file we just wrote"),
+            &output_file,
+        )
+        .expect("Couldn't parse libinfo map from profile file");
+
+        start_server_main(&output_file, server_props, symbol_props, libinfo_map);
     }
 
     Ok(exit_status)

@@ -1,8 +1,7 @@
 use std::collections::hash_map::Entry;
 
-use fxprof_processed_profile::{CpuDelta, FrameInfo, ThreadHandle, Timestamp};
+use fxprof_processed_profile::{CpuDelta, FrameInfo, MarkerHandle, ThreadHandle, Timestamp};
 
-use super::process_sample_data::RssStatMember;
 use super::types::{FastHashMap, StackFrame, StackMode};
 
 #[derive(Debug, Clone, Default)]
@@ -114,16 +113,13 @@ impl UnresolvedSamples {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn add_rss_stat_marker(
+    pub fn attach_stack_to_marker(
         &mut self,
         thread_handle: ThreadHandle,
         timestamp: Timestamp,
         timestamp_mono: u64,
         stack: UnresolvedStackHandle,
-        rss_member: RssStatMember,
-        rss_size: i64,
-        rss_delta: i64,
+        marker_handle: MarkerHandle,
     ) {
         self.samples_and_markers.push(UnresolvedSampleOrMarker {
             thread_handle,
@@ -131,29 +127,7 @@ impl UnresolvedSamples {
             timestamp_mono,
             stack,
             extra_label_frame: None,
-            sample_or_marker: SampleOrMarker::RssStatMarker(RssStatMarkerData {
-                member: rss_member,
-                size: rss_size,
-                delta: rss_delta,
-            }),
-        });
-    }
-
-    pub fn add_other_event_marker(
-        &mut self,
-        thread_handle: ThreadHandle,
-        timestamp: Timestamp,
-        timestamp_mono: u64,
-        stack: UnresolvedStackHandle,
-        attr_index: usize,
-    ) {
-        self.samples_and_markers.push(UnresolvedSampleOrMarker {
-            thread_handle,
-            timestamp,
-            timestamp_mono,
-            stack,
-            extra_label_frame: None,
-            sample_or_marker: SampleOrMarker::OtherEventMarker(OtherEventMarkerData { attr_index }),
+            sample_or_marker: SampleOrMarker::MarkerHandle(marker_handle),
         });
     }
 }
@@ -171,34 +145,13 @@ pub struct UnresolvedSampleOrMarker {
 #[derive(Debug, Clone)]
 pub enum SampleOrMarker {
     Sample(SampleData),
-    RssStatMarker(RssStatMarkerData),
-    OtherEventMarker(OtherEventMarkerData),
+    MarkerHandle(MarkerHandle),
 }
 
 #[derive(Debug, Clone)]
 pub struct SampleData {
     pub cpu_delta: CpuDelta,
     pub weight: i32,
-}
-
-#[derive(Debug, Clone)]
-pub struct RssStatMarkerData {
-    pub member: RssStatMember,
-    pub size: i64,
-    pub delta: i64,
-}
-
-#[derive(Debug, Clone)]
-pub struct OtherEventMarkerData {
-    pub attr_index: usize,
-}
-
-#[derive(Debug, Clone)]
-pub struct UnresolvedRssStatMarker {
-    pub thread_handle: ThreadHandle,
-    pub timestamp: Timestamp,
-    pub timestamp_mono: u64,
-    pub stack: UnresolvedStackHandle,
 }
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
@@ -239,12 +192,7 @@ impl UnresolvedStacks {
         frames: impl Iterator<Item = StackFrame>,
     ) -> UnresolvedStackHandle {
         let mut prefix = UnresolvedStackHandle::EMPTY;
-        for frame in frames {
-            match frame {
-                StackFrame::InstructionPointer(_, StackMode::Kernel) => continue,
-                StackFrame::ReturnAddress(_, StackMode::Kernel) => continue,
-                _ => {}
-            }
+        for frame in frames.filter(|f| f.stack_mode() != Some(StackMode::Kernel)) {
             let x = (prefix, frame);
             let node = *self.stack_lookup.entry(x).or_insert_with(|| {
                 let new_index = self.stacks.len() as u32;

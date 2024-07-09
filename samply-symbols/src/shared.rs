@@ -1,20 +1,21 @@
+#[cfg(feature = "partial_read_stats")]
+use std::cell::RefCell;
+use std::fmt::{Debug, Display};
+use std::future::Future;
+use std::marker::PhantomData;
+use std::ops::{Deref, Range};
+use std::str::FromStr;
+use std::sync::Arc;
+
+#[cfg(feature = "partial_read_stats")]
+use bitvec::{bitvec, prelude::BitVec};
 use debugid::DebugId;
 use object::read::ReadRef;
 use object::FileFlags;
 use uuid::Uuid;
 
-use crate::MappedPath;
-
-use std::fmt::{Debug, Display};
-use std::future::Future;
-use std::ops::Range;
-use std::str::FromStr;
-use std::{marker::PhantomData, ops::Deref};
-
-#[cfg(feature = "partial_read_stats")]
-use bitvec::{bitvec, prelude::BitVec};
-#[cfg(feature = "partial_read_stats")]
-use std::cell::RefCell;
+use crate::mapped_path::MappedPath;
+use crate::symbol_map::SymbolMapTrait;
 
 pub type FileAndPathHelperError = Box<dyn std::error::Error + Send + Sync + 'static>;
 pub type FileAndPathHelperResult<T> = std::result::Result<T, FileAndPathHelperError>;
@@ -42,12 +43,72 @@ pub trait OptionallySendFuture: Future + Send {}
 #[cfg(feature = "send_futures")]
 impl<T> OptionallySendFuture for T where T: Future + Send {}
 
+#[derive(Debug)]
 pub enum CandidatePathInfo<FL: FileLocation> {
     SingleFile(FL),
     InDyldCache {
         dyld_cache_path: FL,
         dylib_path: String,
     },
+}
+
+/// An address that can be looked up in a `SymbolMap`.
+///
+/// You'll usually want to use `LookupAddress::Relative`, i.e. addresses that
+/// are relative to some "image base address". This form works with all types
+/// of symbol maps across all platforms.
+///
+/// When testing, be aware that many binaries are laid out in such a way that
+/// all three representations of addresses are the same: The image base address
+/// is often zero and the sections are often laid out so that each section's
+/// address matches its file offset. So if you misrepresent an address in
+/// the wrong form, you might not notice it because it still works until you
+/// encounter a more complex binary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum LookupAddress {
+    /// A relative address is relative to the image base address.
+    ///
+    /// What this means depends on the format of the binary:
+    ///
+    /// - On Windows, a "relative address" is the same as a RVA ("relative virtual
+    ///   address") in the PE file.
+    /// - On macOS, a "relative address" is relative to the start of the `__TEXT`
+    ///   segment.
+    /// - On Linux / ELF, a "relative address" is relative to the address of the
+    ///   first LOAD command in the program header table. In other words, it's
+    ///   relative to the start of the first segment.
+    /// - For Jitdump files, the "relative address" space is a conceptual space
+    ///   in which the code from all `JIT_CODE_LOAD` records is laid out
+    ///   sequentially, starting at 0.
+    ///   So the relative address of an instruction inside a `JIT_CODE_LOAD` record
+    ///   is the sum of the `code_size` fields of all previous `JIT_CODE_LOAD`
+    ///   records plus the offset of the instruction within the code of this
+    ///   `JIT_CODE_LOAD` record.
+    ///
+    /// See [`relative_address_base`] for more information.
+    Relative(u32),
+    /// A "stated virtual memory address", i.e. a virtual memory address as
+    /// written down in the binary. In mach-O and ELF, this is the space that
+    /// section addresses and symbol addresses are in. It's the type of address
+    /// you'd pass to the Linux `addr2line` tool.
+    ///
+    /// This type of lookup address is not supported by symbol maps for PDB
+    /// files or Breakpad files.
+    Svma(u64),
+    /// A raw file offset to the point in the binary file where the bytes of the
+    /// instruction are stored for which symbols should be looked up.
+    ///
+    /// On Linux, if you have an "AVMA" (absolute virtual memory address) and
+    /// the `/proc/<pid>/maps` for the process, this is probably the easiest
+    /// form of address to compute, because the process maps give you the file offsets.
+    ///
+    /// However, if you do this, be aware that the file offset often is not
+    /// the same as an SVMA, so expect wrong results if you end up using it in
+    /// places where SVMAs are expected - it might work fine with some binaries
+    /// and then break with others.
+    ///
+    /// File offsets are not supported by symbol maps for PDB files or Breakpad files.
+    FileOffset(u64),
 }
 
 /// In case the loaded binary contains multiple architectures, this specifies
@@ -128,16 +189,19 @@ impl FromStr for CodeId {
         if s.len() <= 17 {
             // 8 bytes timestamp + 1 to 8 bytes of image size
             Ok(CodeId::PeCodeId(PeCodeId::from_str(s)?))
-        } else if s.len() == 32 {
+        } else if s.len() == 32 && is_uppercase_hex(s) {
             // mach-O UUID
             Ok(CodeId::MachoUuid(Uuid::from_str(s).map_err(|_| ())?))
-        } else if s.len() >= 34 {
+        } else {
             // ELF build ID. These are usually 40 hex characters (= 20 bytes).
             Ok(CodeId::ElfBuildId(ElfBuildId::from_str(s)?))
-        } else {
-            Err(())
         }
     }
+}
+
+fn is_uppercase_hex(s: &str) -> bool {
+    s.chars()
+        .all(|c| c.is_ascii_hexdigit() && (c.is_ascii_digit() || c.is_ascii_uppercase()))
 }
 
 impl std::fmt::Display for CodeId {
@@ -248,25 +312,25 @@ impl LibraryInfo {
     /// matches.
     pub fn absorb(&mut self, other: &LibraryInfo) {
         if self.debug_name.is_none() && other.debug_name.is_some() {
-            self.debug_name = other.debug_name.clone();
+            self.debug_name.clone_from(&other.debug_name);
         }
         if self.debug_id.is_none() && other.debug_id.is_some() {
             self.debug_id = other.debug_id;
         }
         if self.debug_path.is_none() && other.debug_path.is_some() {
-            self.debug_path = other.debug_path.clone();
+            self.debug_path.clone_from(&other.debug_path);
         }
         if self.name.is_none() && other.name.is_some() {
-            self.name = other.name.clone();
+            self.name.clone_from(&other.name);
         }
         if self.code_id.is_none() && other.code_id.is_some() {
-            self.code_id = other.code_id.clone();
+            self.code_id.clone_from(&other.code_id);
         }
         if self.path.is_none() && other.path.is_some() {
-            self.path = other.path.clone();
+            self.path.clone_from(&other.path);
         }
         if self.arch.is_none() && other.arch.is_some() {
-            self.arch = other.arch.clone();
+            self.arch.clone_from(&other.arch);
         }
     }
 }
@@ -275,11 +339,9 @@ impl LibraryInfo {
 /// the main entry points of this crate. This crate contains no direct file
 /// access - all access to the file system is via this trait, and its associated
 /// trait `FileContents`.
-pub trait FileAndPathHelper<'h> {
+pub trait FileAndPathHelper {
     type F: FileContents + 'static;
     type FL: FileLocation + 'static;
-
-    type OpenFileFuture: OptionallySendFuture<Output = FileAndPathHelperResult<Self::F>> + 'h;
 
     /// Given a "debug name" and a "breakpad ID", return a list of file paths
     /// which may potentially have artifacts containing symbol data for the
@@ -342,46 +404,22 @@ pub trait FileAndPathHelper<'h> {
     /// available synchronously because the `FileContents` methods are synchronous.
     /// If there is no file at the requested path, an error should be returned (or in any
     /// other error case).
-    fn load_file(&'h self, location: Self::FL) -> Self::OpenFileFuture;
+    fn load_file(
+        &self,
+        location: Self::FL,
+    ) -> std::pin::Pin<Box<dyn OptionallySendFuture<Output = FileAndPathHelperResult<Self::F>> + '_>>;
+
+    /// Ask the helper to return a SymbolMap if it happens to have one available already.
+    fn get_symbol_map_for_library(
+        &self,
+        _info: &LibraryInfo,
+    ) -> Option<(Self::FL, Arc<dyn SymbolMapTrait + Send + Sync>)> {
+        None
+    }
 }
 
 /// Provides synchronous access to the raw bytes of a file.
 /// This trait needs to be implemented by the consumer of this crate.
-#[cfg(not(feature = "send_futures"))]
-pub trait FileContents {
-    /// Must return the length, in bytes, of this file.
-    fn len(&self) -> u64;
-
-    /// Whether the file is empty.
-    fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    /// Must return a slice of the file contents, or an error.
-    /// The slice's lifetime must be valid for the entire lifetime of this
-    /// `FileContents` object. This restriction may be a bit cumbersome to satisfy;
-    /// it's a restriction that's inherited from the `object` crate's `ReadRef` trait.
-    fn read_bytes_at(&self, offset: u64, size: u64) -> FileAndPathHelperResult<&[u8]>;
-
-    /// TODO: document
-    fn read_bytes_at_until(
-        &self,
-        range: Range<u64>,
-        delimiter: u8,
-    ) -> FileAndPathHelperResult<&[u8]>;
-
-    /// Append `size` bytes to `buffer`, starting to read at `offset` in the file.
-    /// If successful, `buffer` must have had its len increased exactly by `size`,
-    /// otherwise the caller may panic.
-    fn read_bytes_into(
-        &self,
-        buffer: &mut Vec<u8>,
-        offset: u64,
-        size: usize,
-    ) -> FileAndPathHelperResult<()>;
-}
-
-#[cfg(feature = "send_futures")]
 pub trait FileContents: Send + Sync {
     /// Must return the length, in bytes, of this file.
     fn len(&self) -> u64;
@@ -466,6 +504,10 @@ pub trait FileLocation: Clone + Display {
     /// Called on the location of a Breakpad sym file, to get a location for its
     /// corresponding symindex file.
     fn location_for_breakpad_symindex(&self) -> Option<Self>;
+
+    fn location_for_dwo(&self, comp_dir: &str, path: &str) -> Option<Self>;
+
+    fn location_for_dwp(&self) -> Option<Self>;
 }
 
 /// The path of a source file, as found in the debug info.
@@ -569,13 +611,9 @@ impl SourceFilePath {
     }
 }
 
-/// In calls to `SymbolMap::lookup_relative_address`, the requested addresses
-/// are in "relative address" form.
-/// This is in contrast to the u64 SVMA ("stated virtual memory address") form
-/// which is used by section addresses, symbol addresses and DWARF pc offset
-/// information.
-///
-/// Relative addresses are u32 offsets which are relative to some "base address".
+/// The "relative address base" is the base address which [`LookupAddress::Relative`]
+/// addresses are relative to. You start with an SVMA (a stated virtual memory address),
+/// you subtract the relative address base, and out comes a relative address.
 ///
 /// This function computes that base address. It is defined as follows:
 ///
@@ -605,9 +643,7 @@ impl SourceFilePath {
 ///    0xffffffff81000000. Moreover, the base address seems to coincide with the
 ///    vmaddr of the .text section, which is readily-available in perf.data files
 ///    (in a synthetic mapping called "[kernel.kallsyms]_text").
-pub fn relative_address_base<'data: 'file, 'file>(
-    object_file: &'file impl object::Object<'data, 'file>,
-) -> u64 {
+pub fn relative_address_base<'data>(object_file: &impl object::Object<'data>) -> u64 {
     use object::read::ObjectSegment;
     if let Some(text_segment) = object_file
         .segments()
@@ -646,8 +682,25 @@ pub struct SymbolInfo {
 pub struct AddressInfo {
     /// Information about the symbol which contains the looked up address.
     pub symbol: SymbolInfo,
+    /// Information about the frames at the looked up address, if found in the debug info.
+    ///
+    /// This Vec contains the file name and line number of the address.
+    /// If the compiler inlined a function call at this address, then this Vec
+    /// also contains the function name of the inlined function, along with the
+    /// file and line information inside that function.
+    ///
+    /// The Vec begins with the callee-most ("innermost") inlinee, followed by
+    /// its caller, and so on. The last element is always the outer function.
+    pub frames: Option<Vec<FrameDebugInfo>>,
+}
+
+/// The lookup result from `lookup_sync`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncAddressInfo {
+    /// Information about the symbol which contains the looked up address.
+    pub symbol: SymbolInfo,
     /// Information about the frames at the looked up address, from the debug info.
-    pub frames: FramesLookupResult,
+    pub frames: Option<FramesLookupResult>,
 }
 
 /// Contains address debug info (inlined functions, file names, line numbers) if
@@ -667,7 +720,7 @@ pub enum FramesLookupResult {
 
     /// Debug info for this address was not found in the symbol map, but can
     /// potentially be found in a different file, with the help of
-    /// `SymbolManager::lookup_external`.
+    /// [`SymbolMap::lookup_external`](crate::SymbolMap::lookup_external).
     ///
     /// This case can currently only be hit on macOS: On macOS, linking multiple
     /// `.o` files together into a library or an executable does not copy the
@@ -675,13 +728,11 @@ pub enum FramesLookupResult {
     /// paths to those original `.o` files, using 'OSO' stabs entries, and debug
     /// info must be obtained from those original files.
     External(ExternalFileAddressRef),
-
-    /// No debug info is available.
-    Unavailable,
 }
 
 /// Information to find an external file and an address within that file, to be
-/// passed to `SymbolManager::lookup_external`.
+/// passed to [`SymbolMap::lookup_external`](crate::SymbolMap::lookup_external) or
+/// [`ExternalFileSymbolMap::lookup`](crate::ExternalFileSymbolMap::lookup).
 #[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ExternalFileAddressRef {
     /// Information needed to find the external file.
@@ -692,26 +743,42 @@ pub struct ExternalFileAddressRef {
 
 /// Information to find an external file with debug information.
 #[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
-pub struct ExternalFileRef {
-    /// The path to the file, as specified in the linked binary's object map.
-    pub file_name: String,
-    /// A mach-O arch string ("x86_64", "arm64" etc.) which is needed in the rare case
-    /// that the external file is a fat binary.
-    pub arch: Option<String>,
+pub enum ExternalFileRef {
+    MachoExternalObject {
+        /// The path to the file, as specified in the linked binary's object map.
+        file_path: String,
+    },
+    ElfExternalDwo {
+        comp_dir: String,
+        path: String,
+    },
 }
 
 /// Information to find an address within an external file, for debug info lookup.
 #[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
-pub struct ExternalFileAddressInFileRef {
-    /// If the external file is an archive file (e.g. `libjs_static.a`, created with `ar`),
-    /// then this is the name of the archive member (e.g. `Unified_cpp_js_src23.o`),
-    /// otherwise `None`.
-    pub name_in_archive: Option<String>,
-    /// The name of the function symbol, as bytes, for the function which contains the
-    /// address we want to look up.
-    pub symbol_name: Vec<u8>,
-    /// The address to look up, as a relative offset from the function symbol address.
-    pub offset_from_symbol: u32,
+pub enum ExternalFileAddressInFileRef {
+    MachoOsoObject {
+        /// The name of the function symbol, as bytes, for the function which contains the
+        /// address we want to look up.
+        symbol_name: Vec<u8>,
+        /// The address to look up, as a relative offset from the function symbol address.
+        offset_from_symbol: u32,
+    },
+    MachoOsoArchive {
+        /// If the external file is an archive file (e.g. `libjs_static.a`, created with `ar`),
+        /// then this is the name of the archive member (e.g. `Unified_cpp_js_src23.o`),
+        /// otherwise `None`.
+        name_in_archive: String,
+        /// The name of the function symbol, as bytes, for the function which contains the
+        /// address we want to look up.
+        symbol_name: Vec<u8>,
+        /// The address to look up, as a relative offset from the function symbol address.
+        offset_from_symbol: u32,
+    },
+    ElfDwo {
+        dwo_id: u64,
+        svma: u64,
+    },
 }
 
 /// Implementation for slices.
@@ -836,7 +903,7 @@ pub struct FileContentsWrapper<T: FileContents> {
     file_contents: T,
     len: u64,
     #[cfg(feature = "partial_read_stats")]
-    partial_read_stats: RefCell<FileReadStats>,
+    partial_read_stats: std::sync::Mutex<FileReadStats>,
 }
 
 impl<T: FileContents> FileContentsWrapper<T> {
@@ -846,7 +913,7 @@ impl<T: FileContents> FileContentsWrapper<T> {
             file_contents,
             len,
             #[cfg(feature = "partial_read_stats")]
-            partial_read_stats: RefCell::new(FileReadStats::new(len)),
+            partial_read_stats: std::sync::Mutex::new(FileReadStats::new(len)),
         }
     }
 
@@ -864,7 +931,8 @@ impl<T: FileContents> FileContentsWrapper<T> {
     pub fn read_bytes_at(&self, offset: u64, size: u64) -> FileAndPathHelperResult<&[u8]> {
         #[cfg(feature = "partial_read_stats")]
         self.partial_read_stats
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .record_read(offset, size);
 
         self.file_contents.read_bytes_at(offset, size)
@@ -883,7 +951,8 @@ impl<T: FileContents> FileContentsWrapper<T> {
 
         #[cfg(feature = "partial_read_stats")]
         self.partial_read_stats
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .record_read(start, (bytes.len() + 1) as u64);
 
         Ok(bytes)
@@ -900,7 +969,8 @@ impl<T: FileContents> FileContentsWrapper<T> {
     ) -> FileAndPathHelperResult<()> {
         #[cfg(feature = "partial_read_stats")]
         self.partial_read_stats
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .record_read(offset, size as u64);
 
         self.file_contents.read_bytes_into(buffer, offset, size)
@@ -922,7 +992,7 @@ impl<T: FileContents> FileContentsWrapper<T> {
 #[cfg(feature = "partial_read_stats")]
 impl<T: FileContents> Drop for FileContentsWrapper<T> {
     fn drop(&mut self) {
-        eprintln!("{}", self.partial_read_stats.borrow());
+        eprintln!("{}", self.partial_read_stats.lock());
     }
 }
 

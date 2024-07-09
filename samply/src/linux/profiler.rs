@@ -1,27 +1,35 @@
-use crossbeam_channel::{Receiver, Sender};
-use linux_perf_data::linux_perf_event_reader::EventRecord;
-use linux_perf_data::linux_perf_event_reader::{
-    CpuMode, Endianness, Mmap2FileId, Mmap2InodeAndVersion, Mmap2Record, RawData,
-};
-
 use std::collections::HashMap;
-use std::ffi::OsString;
 use std::fs::File;
-use std::io::BufWriter;
+use std::ops::Deref;
+use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::process::ExitStatus;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
+
+use crossbeam_channel::{Receiver, Sender};
+use fxprof_processed_profile::ReferenceTimestamp;
+use linux_perf_data::linux_perf_event_reader::{
+    CpuMode, Endianness, EventRecord, Mmap2FileId, Mmap2InodeAndVersion, Mmap2Record, RawData,
+};
+use nix::sys::wait::WaitStatus;
+use tokio::sync::oneshot;
 
 use super::perf_event::EventSource;
 use super::perf_group::{AttachMode, PerfGroup};
 use super::proc_maps;
 use super::process::SuspendedLaunchedProcess;
-use crate::linux_shared::{ConvertRegs, Converter, EventInterpretation, MmapRangeOrVec};
+use crate::linux_shared::vdso::VdsoObject;
+use crate::linux_shared::{
+    ConvertRegs, Converter, EventInterpretation, MmapRangeOrVec, OffCpuIndicator,
+};
 use crate::server::{start_server_main, ServerProps};
-use crate::shared::recording_props::{ConversionProps, RecordingProps};
+use crate::shared::ctrl_c::CtrlC;
+use crate::shared::recording_props::{
+    ProcessLaunchProps, ProfileCreationProps, RecordingMode, RecordingProps,
+};
+use crate::shared::save_profile::save_profile_to_file;
+use crate::shared::symbol_props::SymbolProps;
 
 #[cfg(target_arch = "x86_64")]
 pub type ConvertRegsNative = crate::linux_shared::ConvertRegsX86_64;
@@ -29,32 +37,60 @@ pub type ConvertRegsNative = crate::linux_shared::ConvertRegsX86_64;
 #[cfg(target_arch = "aarch64")]
 pub type ConvertRegsNative = crate::linux_shared::ConvertRegsAarch64;
 
-#[allow(clippy::too_many_arguments)]
 pub fn start_recording(
-    command_name: OsString,
-    command_args: &[OsString],
-    iteration_count: u32,
+    recording_mode: RecordingMode,
     recording_props: RecordingProps,
-    conversion_props: ConversionProps,
+    profile_creation_props: ProfileCreationProps,
+    symbol_props: SymbolProps,
     server_props: Option<ServerProps>,
 ) -> Result<ExitStatus, ()> {
+    let process_launch_props = match recording_mode {
+        RecordingMode::All => {
+            // TODO: Implement, by sudo launching a helper process which opens cpu-wide perf events
+            eprintln!("Error: Profiling all processes is currently not supported on Linux.");
+            eprintln!("You can profile processes which you launch via samply, or attach to a single process.");
+            std::process::exit(1)
+        }
+        RecordingMode::Pid(pid) => {
+            start_profiling_pid(
+                pid,
+                recording_props,
+                profile_creation_props,
+                symbol_props,
+                server_props,
+            );
+            return Ok(ExitStatus::from_raw(0));
+        }
+        RecordingMode::Launch(process_launch_props) => process_launch_props,
+    };
+
     // We want to profile a child process which we are about to launch.
 
-    // Ignore SIGINT in our process while the child process is running. The
-    // signal will still reach the child process, because Ctrl+C sends the
-    // SIGINT signal to all processes in the foreground process group.
-    let should_terminate_on_ctrl_c = Arc::new(AtomicBool::new(false));
-    #[cfg(unix)]
-    signal_hook::flag::register_conditional_default(
-        signal_hook::consts::SIGINT,
-        should_terminate_on_ctrl_c.clone(),
-    )
-    .expect("cannot register signal handler");
+    let ProcessLaunchProps {
+        mut env_vars,
+        command_name,
+        args,
+        iteration_count,
+    } = process_launch_props;
+
+    if profile_creation_props.coreclr.any_enabled() {
+        // We need to set DOTNET_PerfMapEnabled=2 in the environment if it's not already set.
+        // TODO: implement unlink_aux_files for linux
+        if !env_vars.iter().any(|p| p.0 == "DOTNET_PerfMapEnabled") {
+            env_vars.push(("DOTNET_PerfMapEnabled".into(), "2".into()));
+        }
+    }
+
+    // Ignore Ctrl+C while the subcommand is running. The signal still reaches the process
+    // under observation while we continue to record it. (ctrl+c will send the SIGINT signal
+    // to all processes in the foreground process group).
+    let mut ctrl_c_receiver = CtrlC::observe_oneshot();
 
     // Start a new process for the launched command and get its pid.
     // The command will not start running until we tell it to.
     let process =
-        SuspendedLaunchedProcess::launch_in_suspended_state(&command_name, command_args).unwrap();
+        SuspendedLaunchedProcess::launch_in_suspended_state(&command_name, &args, &env_vars)
+            .unwrap();
     let pid = process.pid();
 
     // Create a channel for the observer thread to notify the main thread once
@@ -68,8 +104,18 @@ pub fn start_recording(
     let output_file_copy = recording_props.output_file.clone();
     let interval = recording_props.interval;
     let time_limit = recording_props.time_limit;
+    let initial_exec_name = command_name.to_string_lossy().to_string();
+    let initial_cmdline: Vec<String> = std::iter::once(initial_exec_name.clone())
+        .chain(args.iter().map(|arg| arg.to_string_lossy().to_string()))
+        .collect();
+    let initial_exec_name = match initial_exec_name.rfind('/') {
+        Some(pos) => initial_exec_name[pos + 1..].to_string(),
+        None => initial_exec_name,
+    };
+    let initial_exec_name_and_cmdline = (initial_exec_name, initial_cmdline);
     let observer_thread = thread::spawn(move || {
-        let mut converter = make_converter(interval, conversion_props);
+        let unstable_presymbolicate = profile_creation_props.unstable_presymbolicate;
+        let mut converter = make_converter(interval, profile_creation_props);
 
         // Wait for the initial pid to profile.
         let SamplerRequest::StartProfilingAnotherProcess(pid, attach_mode) =
@@ -84,12 +130,12 @@ pub fn start_recording(
         // Tell the main thread to tell the child process to begin executing.
         profile_another_pid_reply_sender.send(true).unwrap();
 
-        // Create a stop flag which always stays false. We won't stop profiling until the
+        // Create a stop receiver which is never notified. We won't stop profiling until the
         // child process is done.
         // If Ctrl+C is pressed, it will reach the child process, and the child process
         // will act on it and maybe terminate. If it does, profiling stops too because
         // the main thread's wait() call below will exit.
-        let stop_flag = Arc::new(AtomicBool::new(false));
+        let (_stop_sender, stop_receiver) = oneshot::channel();
 
         // Start profiling the process.
         run_profiler(
@@ -99,7 +145,9 @@ pub fn start_recording(
             time_limit,
             profile_another_pid_request_receiver,
             profile_another_pid_reply_sender,
-            stop_flag,
+            stop_receiver,
+            unstable_presymbolicate,
+            Some(initial_exec_name_and_cmdline),
         );
     });
 
@@ -117,6 +165,15 @@ pub fn start_recording(
     // Now tell the child process to start executing.
     let process = match process.unsuspend_and_run() {
         Ok(process) => process,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            let command_name = command_name.to_string_lossy();
+            if command_name.starts_with('-') {
+                eprintln!("error: unexpected argument '{command_name}' found");
+            } else {
+                eprintln!("Error: Could not find an executable with the name {command_name}.");
+            }
+            std::process::exit(1)
+        }
         Err(run_err) => {
             eprintln!("Could not launch child process: {run_err}");
             std::process::exit(1)
@@ -127,19 +184,22 @@ pub fn start_recording(
 
     // Wait for the child process to quit.
     // This is where the main thread spends all its time during profiling.
-    let mut exit_status = process.wait().unwrap();
+    let mut wait_status = process.wait().unwrap();
 
     for i in 2..=iteration_count {
-        if !exit_status.success() {
+        let previous_run_exited_with_success = match &wait_status {
+            WaitStatus::Exited(_pid, exit_code) => ExitStatus::from_raw(*exit_code).success(),
+            _ => false,
+        };
+        if !previous_run_exited_with_success {
             eprintln!(
-                "Skipping remaining iterations due to non-success exit status: \"{}\"",
-                exit_status
+                "Skipping remaining iterations due to non-success exit status: {wait_status:?}"
             );
             break;
         }
         eprintln!("Running iteration {i} of {iteration_count}...");
         let process =
-            SuspendedLaunchedProcess::launch_in_suspended_state(&command_name, command_args)
+            SuspendedLaunchedProcess::launch_in_suspended_state(&command_name, &args, &env_vars)
                 .unwrap();
         let pid = process.pid();
 
@@ -158,22 +218,26 @@ pub fn start_recording(
         // Now tell the child process to start executing.
         let process = match process.unsuspend_and_run() {
             Ok(process) => process,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                let command_name = command_name.to_string_lossy();
+                eprintln!("Error: Could not find an executable with the name {command_name}.");
+                std::process::exit(1)
+            }
             Err(run_err) => {
                 eprintln!("Could not launch child process: {run_err}");
                 break;
             }
         };
 
-        exit_status = process.wait().expect("couldn't wait for child");
+        wait_status = process.wait().expect("couldn't wait for child");
     }
 
     profile_another_pid_request_sender
         .send(SamplerRequest::StopProfilingOncePerfEventsExhausted)
         .unwrap();
 
-    // The child has quit.
-    // From now on, we want to terminate if the user presses Ctrl+C.
-    should_terminate_on_ctrl_c.store(true, std::sync::atomic::Ordering::SeqCst);
+    // The launched subprocess is done. From now on, we want to terminate if the user presses Ctrl+C.
+    ctrl_c_receiver.close();
 
     // Now wait for the observer thread to quit. It will keep running until all
     // perf events are closed, which happens if all processes which the events
@@ -183,27 +247,32 @@ pub fn start_recording(
         .expect("couldn't join observer thread");
 
     if let Some(server_props) = server_props {
-        start_server_main(&recording_props.output_file, server_props);
+        let profile_filename = &recording_props.output_file;
+        let libinfo_map = crate::profile_json_preparse::parse_libinfo_map_from_profile_file(
+            File::open(profile_filename).expect("Couldn't open file we just wrote"),
+            profile_filename,
+        )
+        .expect("Couldn't parse libinfo map from profile file");
+
+        start_server_main(profile_filename, server_props, symbol_props, libinfo_map);
     }
 
+    let exit_status = match wait_status {
+        WaitStatus::Exited(_pid, exit_code) => ExitStatus::from_raw(exit_code),
+        _ => ExitStatus::default(),
+    };
     Ok(exit_status)
 }
 
-pub fn start_profiling_pid(
+fn start_profiling_pid(
     pid: u32,
     recording_props: RecordingProps,
-    conversion_props: ConversionProps,
+    profile_creation_props: ProfileCreationProps,
+    symbol_props: SymbolProps,
     server_props: Option<ServerProps>,
 ) {
     // When the first Ctrl+C is received, stop recording.
-    // The server launches after the recording finishes. On the second Ctrl+C, terminate the server.
-    let stop = Arc::new(AtomicBool::new(false));
-    #[cfg(unix)]
-    signal_hook::flag::register_conditional_default(signal_hook::consts::SIGINT, stop.clone())
-        .expect("cannot register signal handler");
-    #[cfg(unix)]
-    signal_hook::flag::register(signal_hook::consts::SIGINT, stop.clone())
-        .expect("cannot register signal handler");
+    let ctrl_c_receiver = CtrlC::observe_oneshot();
 
     // Create a channel for the observer thread to notify the main thread once
     // profiling has been initialized.
@@ -214,11 +283,11 @@ pub fn start_profiling_pid(
 
     let output_file = recording_props.output_file.clone();
     let observer_thread = thread::spawn({
-        let stop = stop.clone();
         move || {
             let interval = recording_props.interval;
             let time_limit = recording_props.time_limit;
-            let mut converter = make_converter(interval, conversion_props);
+            let unstable_presymbolicate = profile_creation_props.unstable_presymbolicate;
+            let mut converter = make_converter(interval, profile_creation_props);
             let SamplerRequest::StartProfilingAnotherProcess(pid, attach_mode) =
                 profile_another_pid_request_receiver.recv().unwrap()
             else {
@@ -237,7 +306,9 @@ pub fn start_profiling_pid(
                 time_limit,
                 profile_another_pid_request_receiver,
                 profile_another_pid_reply_sender,
-                stop,
+                ctrl_c_receiver,
+                unstable_presymbolicate,
+                None,
             )
         }
     });
@@ -261,18 +332,23 @@ pub fn start_profiling_pid(
         .unwrap();
 
     // Now wait for the observer thread to quit. It will keep running until the
-    // stop flag has been set to true by Ctrl+C, or until all perf events are closed,
+    // CtrlC receiver has been notified, or until all perf events are closed,
     // which happens if all processes which the events are attached to have quit.
     observer_thread
         .join()
         .expect("couldn't join observer thread");
 
-    // From now on we want Ctrl+C to always quit our process. The stop flag might still be
-    // false if the observer thread finished because the observed processes terminated.
-    stop.store(true, Ordering::SeqCst);
+    // From now on, pressing Ctrl+C will kill our process, because the observer will have
+    // dropped its CtrlC receiver by now.
 
     if let Some(server_props) = server_props {
-        start_server_main(&output_file, server_props);
+        let libinfo_map = crate::profile_json_preparse::parse_libinfo_map_from_profile_file(
+            File::open(&output_file).expect("Couldn't open file we just wrote"),
+            &output_file,
+        )
+        .expect("Couldn't parse libinfo map from profile file");
+
+        start_server_main(&output_file, server_props, symbol_props, libinfo_map);
     }
 }
 
@@ -284,7 +360,7 @@ fn paranoia_level() -> Option<u32> {
 
 fn make_converter(
     interval: Duration,
-    conversion_props: ConversionProps,
+    profile_creation_props: ProfileCreationProps,
 ) -> Converter<framehop::UnwinderNative<MmapRangeOrVec, framehop::MayAllocateDuringUnwind>> {
     let interval_nanos = if interval.as_nanos() > 0 {
         interval.as_nanos() as u64
@@ -304,15 +380,18 @@ fn make_converter(
         main_event_attr_index: 0,
         main_event_name: "cycles".to_string(),
         sampling_is_time_based: Some(interval_nanos),
-        have_context_switches: true,
+        off_cpu_indicator: Some(OffCpuIndicator::ContextSwitches),
         sched_switch_attr_index: None,
         known_event_indices: HashMap::new(),
         event_names: vec!["cycles".to_string()],
     };
 
-    Converter::<framehop::UnwinderNative<MmapRangeOrVec, framehop::MayAllocateDuringUnwind>>::new(
-        &conversion_props.profile_name,
-        None,
+    let mut converter = Converter::<
+        framehop::UnwinderNative<MmapRangeOrVec, framehop::MayAllocateDuringUnwind>,
+    >::new(
+        &profile_creation_props,
+        ReferenceTimestamp::from_system_time(SystemTime::now()),
+        profile_creation_props.profile_name(),
         HashMap::new(),
         machine_info.as_ref().map(|info| info.release.as_str()),
         first_sample_time,
@@ -320,9 +399,13 @@ fn make_converter(
         framehop::CacheNative::new(),
         None,
         interpretation,
-        conversion_props.merge_threads,
-        conversion_props.fold_recursive_prefix,
-    )
+        None,
+        false,
+    );
+    if let Ok(os_release) = os_release::OsRelease::new() {
+        converter.set_os_name(&os_release.pretty_name);
+    }
+    converter
 }
 
 fn init_profiler(
@@ -398,12 +481,20 @@ fn init_profiler(
         }
     };
 
+    let (exe_name, cmdline) = get_process_cmdline(pid).expect("Couldn't read process cmdline");
+    let comm_data = std::fs::read(format!("/proc/{pid}/comm")).expect("Couldn't read process comm");
+    let length = memchr::memchr(b'\0', &comm_data).unwrap_or(comm_data.len());
+    let comm_name = std::str::from_utf8(&comm_data[..length])
+        .unwrap()
+        .trim_end();
+    converter.register_existing_process(pid as i32, comm_name, &exe_name, cmdline);
+
     // TODO: Gather threads / processes recursively, here and in PerfGroup setup.
-    for entry in std::fs::read_dir(format!("/proc/{pid}/task"))
+    for thread_entry in std::fs::read_dir(format!("/proc/{pid}/task"))
         .unwrap()
         .flatten()
     {
-        let tid: u32 = entry.file_name().to_string_lossy().parse().unwrap();
+        let tid: u32 = thread_entry.file_name().to_string_lossy().parse().unwrap();
         let comm_path = format!("/proc/{pid}/task/{tid}/comm");
         if let Ok(buffer) = std::fs::read(comm_path) {
             let length = memchr::memchr(b'\0', &buffer).unwrap_or(buffer.len());
@@ -414,6 +505,9 @@ fn init_profiler(
 
     let maps = read_string_lossy(format!("/proc/{pid}/maps")).expect("couldn't read proc maps");
     let maps = proc_maps::parse(&maps);
+
+    let vdso_file_id = VdsoObject::shared_instance_for_this_process()
+        .map(|vdso| Mmap2FileId::BuildId(vdso.build_id().to_owned()));
 
     for region in maps {
         let mut protection = 0;
@@ -434,6 +528,16 @@ fn init_profiler(
             flags |= libc::MAP_PRIVATE;
         }
 
+        let file_id = match (region.name.deref(), vdso_file_id.as_ref()) {
+            ("[vdso]", Some(vdso_file_id)) => vdso_file_id.clone(),
+            _ => Mmap2FileId::InodeAndVersion(Mmap2InodeAndVersion {
+                major: region.major,
+                minor: region.minor,
+                inode: region.inode,
+                inode_generation: 0,
+            }),
+        };
+
         converter.handle_mmap2(
             Mmap2Record {
                 pid: pid as i32,
@@ -441,12 +545,7 @@ fn init_profiler(
                 address: region.start,
                 length: region.end - region.start,
                 page_offset: region.file_offset,
-                file_id: Mmap2FileId::InodeAndVersion(Mmap2InodeAndVersion {
-                    major: region.major,
-                    minor: region.minor,
-                    inode: region.inode,
-                    inode_generation: 0,
-                }),
+                file_id,
                 protection: protection as _,
                 flags: flags as _,
                 path: RawData::Single(&region.name.into_bytes()),
@@ -472,6 +571,7 @@ enum SamplerRequest {
     StopProfilingOncePerfEventsExhausted,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_profiler(
     mut perf: PerfGroup,
     mut converter: Converter<
@@ -481,7 +581,9 @@ fn run_profiler(
     _time_limit: Option<Duration>,
     more_processes_request_receiver: Receiver<SamplerRequest>,
     more_processes_reply_sender: Sender<bool>,
-    stop: Arc<AtomicBool>,
+    mut stop_receiver: oneshot::Receiver<()>,
+    unstable_presymbolicate: bool,
+    mut initial_exec_name_and_cmdline: Option<(String, Vec<String>)>,
 ) {
     // eprintln!("Running...");
 
@@ -490,7 +592,7 @@ fn run_profiler(
     let mut total_lost_events = 0;
     let mut last_timestamp = 0;
     loop {
-        if stop.load(Ordering::SeqCst) {
+        if stop_receiver.try_recv().is_ok() {
             break;
         }
 
@@ -566,7 +668,27 @@ fn run_profiler(
                     converter.handle_fork(e);
                 }
                 EventRecord::Comm(e) => {
-                    converter.handle_comm(e, record.timestamp());
+                    if e.is_execve {
+                        // Try to get the command line arguments for this process.
+                        let exec_name_and_cmdline =
+                            if let Some(initial) = initial_exec_name_and_cmdline.take() {
+                                // This COMM event is the first exec that we're processing. If we get
+                                // here, it means we're in the "launch process" case and we're seeing
+                                // the exec for that initial launched process.
+                                Some(initial)
+                            } else {
+                                // Attempt to get the process cmdline from /proc/{pid}/cmdline.
+                                // This isn't very reliable because we're processing the perf event records
+                                // in batches, with a delay, so the COMM record may be old enough that the
+                                // pid no longer exists, or the pid may even refer to a different process now.
+                                // Unfortunately there are no perf event records that give us the process
+                                // command line.
+                                get_process_cmdline(e.pid as u32).ok()
+                            };
+                        converter.handle_exec(e, record.timestamp(), exec_name_and_cmdline);
+                    } else {
+                        converter.handle_thread_rename(e, record.timestamp());
+                    }
                 }
                 EventRecord::Exit(e) => {
                     converter.handle_exit(e);
@@ -607,12 +729,36 @@ fn run_profiler(
 
     let profile = converter.finish();
 
-    let output_file = File::create(output_filename).unwrap();
-    let writer = BufWriter::new(output_file);
-    serde_json::to_writer(writer, &profile).expect("Couldn't write JSON");
+    save_profile_to_file(&profile, output_filename).expect("Couldn't write JSON");
+
+    if unstable_presymbolicate {
+        crate::shared::symbol_precog::presymbolicate(
+            &profile,
+            &output_filename.with_extension("syms.json"),
+        );
+    }
 }
 
 pub fn read_string_lossy<P: AsRef<Path>>(path: P) -> std::io::Result<String> {
     let data = std::fs::read(path)?;
     Ok(String::from_utf8_lossy(&data).into_owned())
+}
+
+fn get_process_cmdline(pid: u32) -> std::io::Result<(String, Vec<String>)> {
+    let cmdline_bytes = std::fs::read(format!("/proc/{pid}/cmdline"))?;
+    let mut remaining_bytes = &cmdline_bytes[..];
+    let mut cmdline = Vec::new();
+    while let Some(nul_byte_pos) = memchr::memchr(b'\0', remaining_bytes) {
+        let arg_slice = &remaining_bytes[..nul_byte_pos];
+        remaining_bytes = &remaining_bytes[nul_byte_pos + 1..];
+        cmdline.push(String::from_utf8_lossy(arg_slice).to_string());
+    }
+
+    let exe_arg = &cmdline[0];
+    let exe_name = match exe_arg.rfind('/') {
+        Some(pos) => exe_arg[pos + 1..].to_string(),
+        None => exe_arg.to_string(),
+    };
+
+    Ok((exe_name, cmdline))
 }

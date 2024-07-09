@@ -1,66 +1,40 @@
-use std::{
-    borrow::Cow,
-    collections::{hash_map::Entry, HashMap},
-    sync::Mutex,
-};
+use std::borrow::Cow;
+use std::collections::hash_map::Entry;
+use std::collections::HashMap;
+use std::sync::Mutex;
 
 use yoke::Yoke;
-
-use crate::{
-    symbol_map::{SymbolMapInnerWrapper, SymbolMapTrait},
-    AddressInfo, Error, FileContents, FileContentsWrapper, FileLocation, FrameDebugInfo,
-    FramesLookupResult, SourceFilePath, SymbolInfo, SymbolMap,
-};
+use yoke_derive::Yokeable;
 
 use super::index::{
     BreakpadFileLine, BreakpadFuncSymbol, BreakpadFuncSymbolInfo, BreakpadIndex,
     BreakpadIndexParser, BreakpadInlineOriginLine, BreakpadPublicSymbol, BreakpadPublicSymbolInfo,
     BreakpadSymbolType, FileOrInlineOrigin, ItemMap,
 };
+use crate::symbol_map::{GetInnerSymbolMap, SymbolMapTrait};
+use crate::{
+    Error, FileContents, FileContentsWrapper, FrameDebugInfo, FramesLookupResult, LookupAddress,
+    SourceFilePath, SymbolInfo, SyncAddressInfo,
+};
 
-pub fn get_symbol_map_for_breakpad_sym<F, FL>(
-    file_contents: FileContentsWrapper<F>,
-    file_location: FL,
-    index_file_contents: Option<FileContentsWrapper<F>>,
-) -> Result<SymbolMap<FL>, Error>
-where
-    F: FileContents + 'static,
-    FL: FileLocation,
-{
+pub fn get_symbol_map_for_breakpad_sym<FC: FileContents + 'static>(
+    file_contents: FileContentsWrapper<FC>,
+    index_file_contents: Option<FileContentsWrapper<FC>>,
+) -> Result<BreakpadSymbolMap<FC>, Error> {
     let outer = BreakpadSymbolMapOuter::new(file_contents, index_file_contents)?;
     let symbol_map = BreakpadSymbolMap(Yoke::attach_to_cart(Box::new(outer), |outer| {
         outer.make_symbol_map()
     }));
-    Ok(SymbolMap::new(file_location, Box::new(symbol_map)))
+    Ok(symbol_map)
 }
 
-pub struct BreakpadSymbolMap<T: FileContents>(
-    Yoke<SymbolMapInnerWrapper<'static>, Box<BreakpadSymbolMapOuter<T>>>,
+pub struct BreakpadSymbolMap<T: FileContents + 'static>(
+    Yoke<BreakpadSymbolMapInnerWrapper<'static>, Box<BreakpadSymbolMapOuter<T>>>,
 );
 
-impl<T: FileContents> SymbolMapTrait for BreakpadSymbolMap<T> {
-    fn debug_id(&self) -> debugid::DebugId {
-        self.0.get().0.debug_id()
-    }
-
-    fn symbol_count(&self) -> usize {
-        self.0.get().0.symbol_count()
-    }
-
-    fn iter_symbols(&self) -> Box<dyn Iterator<Item = (u32, Cow<'_, str>)> + '_> {
-        self.0.get().0.iter_symbols()
-    }
-
-    fn lookup_relative_address(&self, address: u32) -> Option<AddressInfo> {
-        self.0.get().0.lookup_relative_address(address)
-    }
-
-    fn lookup_svma(&self, svma: u64) -> Option<AddressInfo> {
-        self.0.get().0.lookup_svma(svma)
-    }
-
-    fn lookup_offset(&self, offset: u64) -> Option<AddressInfo> {
-        self.0.get().0.lookup_offset(offset)
+impl<T: FileContents> GetInnerSymbolMap for BreakpadSymbolMap<T> {
+    fn get_inner_symbol_map<'a>(&'a self) -> &'a (dyn SymbolMapTrait + 'a) {
+        self.0.get().0.as_ref()
     }
 }
 
@@ -105,15 +79,18 @@ impl<T: FileContents> BreakpadSymbolMapOuter<T> {
         Ok(Self { data, index })
     }
 
-    pub fn make_symbol_map(&self) -> SymbolMapInnerWrapper<'_> {
-        let inner = BreakpadSymbolMapInner {
+    pub fn make_symbol_map(&self) -> BreakpadSymbolMapInnerWrapper<'_> {
+        let inner_impl = BreakpadSymbolMapInner {
             data: &self.data,
             index: &self.index,
             cache: Mutex::new(BreakpadSymbolMapCache::new(&self.data, &self.index)),
         };
-        SymbolMapInnerWrapper(Box::new(inner))
+        BreakpadSymbolMapInnerWrapper(Box::new(inner_impl))
     }
 }
+
+#[derive(Yokeable)]
+pub struct BreakpadSymbolMapInnerWrapper<'a>(Box<dyn SymbolMapTrait + Send + Sync + 'a>);
 
 struct BreakpadSymbolMapInner<'a, T: FileContents> {
     data: &'a FileContentsWrapper<T>,
@@ -253,7 +230,18 @@ impl<'a, T: FileContents> SymbolMapTrait for BreakpadSymbolMapInner<'a, T> {
         Box::new(iter)
     }
 
-    fn lookup_relative_address(&self, address: u32) -> Option<AddressInfo> {
+    fn lookup_sync(&self, address: LookupAddress) -> Option<SyncAddressInfo> {
+        let address = match address {
+            LookupAddress::Relative(relative_address) => relative_address,
+            LookupAddress::Svma(_) => {
+                // Breakpad symbol files have no information about the image base address.
+                return None;
+            }
+            LookupAddress::FileOffset(_) => {
+                // Breakpad symbol files have no information about file offsets.
+                return None;
+            }
+        };
         let index = match self.index.symbol_addresses.binary_search(&address) {
             Ok(i) => i,
             Err(0) => return None,
@@ -270,7 +258,7 @@ impl<'a, T: FileContents> SymbolMapTrait for BreakpadSymbolMapInner<'a, T> {
         match &self.index.symbol_offsets[index] {
             BreakpadSymbolType::Public(public) => {
                 let info = symbols.get_public_info(public, self.data).ok()?;
-                Some(AddressInfo {
+                Some(SyncAddressInfo {
                     symbol: SymbolInfo {
                         address: symbol_address,
                         size: next_symbol_address.and_then(|next_symbol_address| {
@@ -278,7 +266,7 @@ impl<'a, T: FileContents> SymbolMapTrait for BreakpadSymbolMapInner<'a, T> {
                         }),
                         name: info.name.to_string(),
                     },
-                    frames: FramesLookupResult::Unavailable,
+                    frames: None,
                 })
             }
             BreakpadSymbolType::Func(func) => {
@@ -322,26 +310,16 @@ impl<'a, T: FileContents> SymbolMapTrait for BreakpadSymbolMapInner<'a, T> {
                 });
                 frames.reverse();
 
-                Some(AddressInfo {
+                Some(SyncAddressInfo {
                     symbol: SymbolInfo {
                         address: symbol_address,
                         size: Some(info.size),
                         name: info.name.to_string(),
                     },
-                    frames: FramesLookupResult::Available(frames),
+                    frames: Some(FramesLookupResult::Available(frames)),
                 })
             }
         }
-    }
-
-    fn lookup_svma(&self, _svma: u64) -> Option<AddressInfo> {
-        // Breakpad symbol files have no information about the image base address.
-        None
-    }
-
-    fn lookup_offset(&self, _offset: u64) -> Option<AddressInfo> {
-        // Breakpad symbol files have no information about file offsets.
-        None
     }
 }
 
@@ -351,44 +329,15 @@ mod test {
 
     use super::*;
 
-    #[derive(Clone)]
-    struct DummyLocation;
-
-    impl FileLocation for DummyLocation {
-        fn location_for_dyld_subcache(&self, _suffix: &str) -> Option<Self> {
-            None
-        }
-
-        fn location_for_external_object_file(&self, _object_file: &str) -> Option<Self> {
-            None
-        }
-
-        fn location_for_pdb_from_binary(&self, _pdb_path: &str) -> Option<Self> {
-            None
-        }
-
-        fn location_for_source_file(&self, _source_file_path: &str) -> Option<Self> {
-            None
-        }
-
-        fn location_for_breakpad_symindex(&self) -> Option<Self> {
-            None
-        }
-    }
-    impl std::fmt::Display for DummyLocation {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            "DummyLocation".fmt(f)
-        }
-    }
-
     #[test]
     fn overeager_demangle() {
         let sym = b"MODULE Linux x86_64 BE4E976C325246EE9D6B7847A670B2A90 example-linux\nFILE 0 filename\nFUNC 1160 45 0 f\n1160 c 16 0";
         let fc = FileContentsWrapper::new(&sym[..]);
-        let symbol_map = get_symbol_map_for_breakpad_sym(fc, DummyLocation, None).unwrap();
+        let symbol_map = get_symbol_map_for_breakpad_sym(fc, None).unwrap();
         assert_eq!(
             symbol_map
-                .lookup_relative_address(0x1160)
+                .get_inner_symbol_map()
+                .lookup_sync(LookupAddress::Relative(0x1160))
                 .unwrap()
                 .symbol
                 .name,
@@ -426,15 +375,17 @@ mod test {
         let full_sym_contents = data_slices.concat();
         let sym_fc = FileContentsWrapper::new(full_sym_contents);
         let symindex_fc = FileContentsWrapper::new(index_bytes);
-        let symbol_map =
-            get_symbol_map_for_breakpad_sym(sym_fc, DummyLocation, Some(symindex_fc)).unwrap();
+        let symbol_map = get_symbol_map_for_breakpad_sym(sym_fc, Some(symindex_fc)).unwrap();
 
         assert_eq!(
-            symbol_map.debug_id(),
+            symbol_map.get_inner_symbol_map().debug_id(),
             DebugId::from_breakpad("F1E853FD662672044C4C44205044422E1").unwrap()
         );
 
-        let lookup_result = symbol_map.lookup_relative_address(0x2b7ed).unwrap();
+        let lookup_result = symbol_map
+            .get_inner_symbol_map()
+            .lookup_sync(LookupAddress::Relative(0x2b7ed))
+            .unwrap();
         assert_eq!(
             lookup_result.symbol.name,
             "DloadAcquireSectionWriteAccess()"
@@ -443,7 +394,7 @@ mod test {
         assert_eq!(lookup_result.symbol.size, Some(0xaa));
 
         let frames = match lookup_result.frames {
-            FramesLookupResult::Available(frames) => frames,
+            Some(FramesLookupResult::Available(frames)) => frames,
             _ => panic!("Frames should be available"),
         };
         assert_eq!(frames.len(), 4);

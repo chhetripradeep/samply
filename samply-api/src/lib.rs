@@ -25,7 +25,7 @@
 //!     let helper = ExampleHelper {
 //!         artifact_directory: this_dir.join("..").join("fixtures").join("win64-ci")
 //!     };
-//!     let symbol_manager = SymbolManager::with_helper(&helper);
+//!     let symbol_manager = SymbolManager::with_helper(helper);
 //!     let api = samply_api::Api::new(&symbol_manager);
 //!
 //!     api.query_api(
@@ -53,12 +53,9 @@
 //!     artifact_directory: std::path::PathBuf,
 //! }
 //!
-//! impl<'h> FileAndPathHelper<'h> for ExampleHelper {
+//! impl FileAndPathHelper for ExampleHelper {
 //!     type F = Vec<u8>;
 //!     type FL = ExampleFileLocation;
-//!     type OpenFileFuture = std::pin::Pin<
-//!         Box<dyn OptionallySendFuture<Output = FileAndPathHelperResult<Self::F>> + 'h>,
-//!     >;
 //!
 //!     fn get_candidate_paths_for_debug_file(
 //!         &self,
@@ -94,16 +91,10 @@
 //!    }
 //!
 //!     fn load_file(
-//!         &'h self,
+//!         &self,
 //!         location: ExampleFileLocation,
-//!     ) -> std::pin::Pin<
-//!         Box<dyn OptionallySendFuture<Output = FileAndPathHelperResult<Self::F>> + 'h>,
-//!     > {
-//!         async fn load_file_impl(path: std::path::PathBuf) -> FileAndPathHelperResult<Vec<u8>> {
-//!             Ok(std::fs::read(&path)?)
-//!         }
-//!
-//!         Box::pin(load_file_impl(location.0))
+//!     ) -> std::pin::Pin<Box<dyn OptionallySendFuture<Output = FileAndPathHelperResult<Self::F>> + '_>> {
+//!         Box::pin(async move { Ok(std::fs::read(&location.0)?) })
 //!     }
 //! }
 //!
@@ -138,15 +129,24 @@
 //!     fn location_for_breakpad_symindex(&self) -> Option<Self> {
 //!         Some(Self(self.0.with_extension("symindex")))
 //!     }
+//!
+//!     fn location_for_dwo(&self, _comp_dir: &str, path: &str) -> Option<Self> {
+//!         Some(Self(std::path::Path::new(path).into()))
+//!     }
+//!
+//!     fn location_for_dwp(&self) -> Option<Self> {
+//!         let mut s = self.0.as_os_str().to_os_string();
+//!         s.push(".dwp");
+//!         Some(Self(s.into()))
+//!     }
 //! }
 //! ```
 
+use asm::AsmApi;
+use debugid::DebugId;
 pub use samply_symbols;
 pub use samply_symbols::debugid;
 use samply_symbols::{FileAndPathHelper, SymbolManager};
-
-use asm::AsmApi;
-use debugid::DebugId;
 use serde_json::json;
 use source::SourceApi;
 use symbolicate::SymbolicateApi;
@@ -159,18 +159,23 @@ mod source;
 mod symbolicate;
 
 pub(crate) fn to_debug_id(breakpad_id: &str) -> Result<DebugId, samply_symbols::Error> {
-    DebugId::from_breakpad(breakpad_id)
-        .map_err(|_| samply_symbols::Error::InvalidBreakpadId(breakpad_id.to_string()))
+    // Only accept breakpad IDs with the right syntax, and which aren't all-zeros.
+    match DebugId::from_breakpad(breakpad_id) {
+        Ok(debug_id) if !debug_id.is_nil() => Ok(debug_id),
+        _ => Err(samply_symbols::Error::InvalidBreakpadId(
+            breakpad_id.to_string(),
+        )),
+    }
 }
 
 #[derive(Clone, Copy)]
-pub struct Api<'a, 'h: 'a, H: FileAndPathHelper<'h>> {
-    symbol_manager: &'a SymbolManager<'h, H>,
+pub struct Api<'a, H: FileAndPathHelper> {
+    symbol_manager: &'a SymbolManager<H>,
 }
 
-impl<'a, 'h: 'a, H: FileAndPathHelper<'h>> Api<'a, 'h, H> {
+impl<'a, H: FileAndPathHelper> Api<'a, H> {
     /// Create a [`Api`] instance which uses the provided [`SymbolManager`].
-    pub fn new(symbol_manager: &'a SymbolManager<'h, H>) -> Self {
+    pub fn new(symbol_manager: &'a SymbolManager<H>) -> Self {
         Self { symbol_manager }
     }
 

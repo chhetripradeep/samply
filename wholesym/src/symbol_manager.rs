@@ -1,18 +1,17 @@
 use std::borrow::Cow;
 use std::path::Path;
-use std::{future::Future, pin::Pin};
+use std::sync::Arc;
 
 use debugid::DebugId;
 use samply_symbols::{
-    self, AddressInfo, Error, ExternalFileAddressRef, ExternalFileRef, ExternalFileSymbolMap,
-    FrameDebugInfo, LibraryInfo, MultiArchDisambiguator,
+    self, AddressInfo, Error, ExternalFileAddressInFileRef, ExternalFileAddressRef, FrameDebugInfo,
+    LibraryInfo, LookupAddress, MultiArchDisambiguator, SymbolMapTrait, SyncAddressInfo,
 };
-use yoke::{Yoke, Yokeable};
 
 use crate::config::SymbolManagerConfig;
-use crate::helper::{FileReadOnlyHelper, Helper, WholesymFileLocation};
+use crate::helper::{FileReadOnlyHelper, Helper, WholesymFileContents, WholesymFileLocation};
 
-/// Used in [`SymbolManager::lookup_external`] and [`SymbolManager::load_external_file`].
+/// Used in [`SymbolManager::load_external_file`] and returned by [`SymbolMap::symbol_file_origin`].
 #[derive(Debug, Clone)]
 pub struct SymbolFileOrigin(WholesymFileLocation);
 
@@ -44,40 +43,67 @@ pub struct SymbolFileOrigin(WholesymFileLocation);
 /// For example, in this file, the file offset `0x9ea` falls into the second segment and
 /// corresponds to the relative address `0x19ea` and to the SVMA `0x2019ea`.
 /// The image base address is `0x200000`.
-pub struct SymbolMap(samply_symbols::SymbolMap<WholesymFileLocation>);
+pub struct SymbolMap(samply_symbols::SymbolMap<Helper>);
 
 impl SymbolMap {
-    /// Look up symbol information by "relative address". This is the preferred lookup
-    /// and supported by all symbol map types.
+    /// Look up symbol information for the specified [`LookupAddress`].
     ///
-    /// A relative address is relative to the image base address. See
-    /// [`relative_address_base`](https://docs.rs/samply-symbols/latest/samply_symbols/fn.relative_address_base.html)
-    /// for more information.
-    pub fn lookup_relative_address(&self, address: u32) -> Option<AddressInfo> {
-        self.0.lookup_relative_address(address)
+    /// This method is asynchronous because it might need to load additional files,
+    /// for example `.dwo` files on Linux or `.o` files on macOS. You can use
+    /// [`SymbolMap::lookup_sync`] if you're calling this in a context where
+    /// you cannot await, or if you don't care about the `.dwo` / `.o` cases.
+    pub async fn lookup(&self, address: LookupAddress) -> Option<AddressInfo> {
+        self.0.lookup(address).await
     }
 
-    /// Look up symbol information by "stated virtual memory address", i.e. a virtual
-    /// memory address as written down in the binary, e.g. as used by symbol addresses.
+    /// Look up symbol information, using only files that have already been loaded.
     ///
-    /// This is not supported by symbol maps for PDB files or Breakpad files.
-    pub fn lookup_svma(&self, address: u64) -> Option<AddressInfo> {
-        self.0.lookup_svma(address)
+    /// If additional files are needed to fully resolve the frame information, this
+    /// will be indicated in the returned [`SyncAddressInfo`]: [`SyncAddressInfo::frames`]
+    /// will be `Some(FramesLookupResult::External(...))`.
+    /// Then you can use [`SymbolMap::lookup_external`] to resolve lookups for these addresses.
+    ///
+    /// Usually you would just use [`SymbolMap::lookup`] instead of `lookup_sync` +
+    /// `lookup_external`. However, there exists a case where doing it manually can perform
+    /// better: If you have many addresses you need to batch-lookup, and you're on macOS
+    /// where some addresses will have to be resolved by loading `.o` files, then you can
+    /// reorder the `lookup_external` calls and avoid reloading the same `.o` file
+    /// multiple times. You'd do this by doing the lookup in two passes: First, call
+    /// `lookup_sync` for every address, and collect all the `ExternalFileAddressRef`s.
+    /// Then, sort the collected `ExternalFileAddressRef`s. This will make it so that all
+    /// addresses that need the same `.o` file are grouped together. Then, call
+    /// `lookup_external` for each `ExternalFileAddressRef` in the sorted order.
+    /// The `SymbolMap` only caches a single `.o` file at a time.
+    pub fn lookup_sync(&self, address: LookupAddress) -> Option<SyncAddressInfo> {
+        self.0.lookup_sync(address)
     }
 
-    /// Look up symbol information by file offset. This is used when you have an absolute
-    /// code address in process memory and map this address to a file offset with the help
-    /// of process maps.
-    pub fn lookup_offset(&self, offset: u64) -> Option<AddressInfo> {
-        self.0.lookup_offset(offset)
+    /// Resolve a debug info lookup for which `SymbolMap::lookup_*` returned
+    /// [`FramesLookupResult::External`](crate::FramesLookupResult::External).
+    ///
+    /// This method is asynchronous because it may load a new external file.
+    ///
+    /// This is used on macOS and on Linux with "unpacked" debuginfo: On macOS it is used
+    /// whenever there is no dSYM, and on Linux it is used to support `-gsplit-dwarf`.
+    /// The debug info is obtained from `.o`/`.a` and `.dwo` files, respectively.
+    ///
+    /// For the macOS case, the `SymbolMap` keeps the most recent external file cached,
+    /// so that repeated calls to `lookup_external` for the same external file are fast.
+    /// For the Linux `.dwo` case, the `SymbolMap` accumulates all `.dwo` files that have
+    /// been loaded for `lookup_external` calls.
+    pub async fn lookup_external(
+        &self,
+        external: &ExternalFileAddressRef,
+    ) -> Option<Vec<FrameDebugInfo>> {
+        self.0.lookup_external(external).await
     }
 
-    /// Returns an abstract "origin token" which needs to be passed to [`SymbolManager::lookup_external`]
+    /// Returns an abstract "origin token" which can be passed to [`SymbolManager::load_external_file`]
     /// when resolving [`FramesLookupResult::External`](crate::FramesLookupResult::External) addresses.
     ///
-    /// Internally, this is used to ensure that we only follow absolute paths to external object files
-    /// which were found in local symbol files, not those which were found in symbol files which were
-    /// downloaded from a symbol server.
+    /// Internally, this is used to ensure that we don't follow random paths found in symbol
+    /// files which were downloaded from a symbol server - we only want to load files from
+    /// these paths if the file that contained these paths is also a local file.
     pub fn symbol_file_origin(&self) -> SymbolFileOrigin {
         SymbolFileOrigin(self.0.debug_file_location().clone())
     }
@@ -100,22 +126,35 @@ impl SymbolMap {
     }
 }
 
+pub struct ExternalFileSymbolMap(samply_symbols::ExternalFileSymbolMap<WholesymFileContents>);
+
+impl ExternalFileSymbolMap {
+    /// The string which identifies this external file. This is usually an absolute
+    /// path.
+    pub fn file_path(&self) -> &str {
+        self.0.file_path()
+    }
+
+    /// Look up the debug info for the given [`ExternalFileAddressInFileRef`].
+    pub fn lookup(
+        &self,
+        external_file_address: &ExternalFileAddressInFileRef,
+    ) -> Option<Vec<FrameDebugInfo>> {
+        self.0.lookup(external_file_address)
+    }
+}
+
 /// Allows obtaining [`SymbolMap`]s.
 pub struct SymbolManager {
-    helper_with_symbol_manager: Yoke<SymbolManagerWrapperTypeErased<'static>, Box<Helper>>,
+    symbol_manager: samply_symbols::SymbolManager<Helper>,
 }
 
 impl SymbolManager {
     /// Create a new `SymbolManager` with the given config.
     pub fn with_config(config: SymbolManagerConfig) -> Self {
         let helper = Helper::with_config(config);
-        let helper_with_symbol_manager = Yoke::attach_to_cart(Box::new(helper), |helper| {
-            let symbol_manager = samply_symbols::SymbolManager::with_helper(helper);
-            SymbolManagerWrapperTypeErased(Box::new(SymbolManagerWrapper(symbol_manager)))
-        });
-        Self {
-            helper_with_symbol_manager,
-        }
+        let symbol_manager = samply_symbols::SymbolManager::with_helper(helper);
+        Self { symbol_manager }
     }
 
     /// Find symbols for the given binary.
@@ -131,11 +170,11 @@ impl SymbolManager {
         path: &Path,
         disambiguator: Option<MultiArchDisambiguator>,
     ) -> Result<SymbolMap, Error> {
-        self.helper_with_symbol_manager
-            .get()
-            .0
-            .load_symbol_map_for_binary_at_path(path, disambiguator)
-            .await
+        let library_info = Self::library_info_for_binary_at_path(path, disambiguator).await?;
+
+        Ok(SymbolMap(
+            self.symbol_manager.load_symbol_map(&library_info).await?,
+        ))
     }
 
     /// Computes the [`LibraryInfo`] for the given binary. This [`LibraryInfo`]
@@ -157,7 +196,7 @@ impl SymbolManager {
             path.starts_with("/usr/") || path.starts_with("/System/");
 
         let helper = FileReadOnlyHelper;
-        let symbol_manager = samply_symbols::SymbolManager::with_helper(&helper);
+        let symbol_manager = samply_symbols::SymbolManager::with_helper(helper);
         let name = path
             .file_name()
             .and_then(|name| Some(name.to_str()?.to_owned()));
@@ -193,8 +232,21 @@ impl SymbolManager {
     /// information which allows us to find the right debug files for the request.
     /// The list of "known libraries" is this auxiliary information.
     pub fn add_known_library(&mut self, lib_info: LibraryInfo) {
-        self.helper_with_symbol_manager
-            .with_mut(|manager| manager.0.add_known_lib(lib_info));
+        self.symbol_manager.helper().add_known_lib(lib_info);
+    }
+
+    /// Tell the `SymbolManager` about a library's symbol table. The library
+    /// must contain a DebugId. This is useful when a library's symbols are
+    /// available in some way other than normal symbol lookup, or if a custom
+    /// format is desired that is not natively supported.
+    pub fn add_known_library_symbols(
+        &mut self,
+        lib_info: LibraryInfo,
+        symbol_map: Arc<dyn SymbolMapTrait + Send + Sync>,
+    ) {
+        self.symbol_manager
+            .helper()
+            .add_precog_symbol_map(lib_info, symbol_map);
     }
 
     /// Obtain a symbol map for the given `debug_name` and `debug_id`.
@@ -203,185 +255,33 @@ impl SymbolManager {
         debug_name: &str,
         debug_id: DebugId,
     ) -> Result<SymbolMap, Error> {
-        self.helper_with_symbol_manager
-            .get()
-            .0
-            .load_symbol_map(debug_name, debug_id)
-            .await
-    }
-
-    /// Resolve a debug info lookup for which `SymbolMap::lookup_*` returned
-    /// [`FramesLookupResult::External`](crate::FramesLookupResult::External).
-    ///
-    /// This method is asynchronous because it may load a new external file.
-    ///
-    /// This is used on macOS: When linking multiple `.o` files together into a library or
-    /// an executable, the linker does not copy the dwarf sections into the linked output.
-    /// Instead, it stores the paths to those original `.o` files, using OSO stabs entries.
-    ///
-    /// A `SymbolMap` for such a linked file will not contain debug info, and will return
-    /// `FramesLookupResult::External` from the lookups. Then the address needs to be
-    /// looked up in the external file.
-    ///
-    /// In the future, this may also be used for loading `.dwo` or `.dwp` files on Linux.
-    ///
-    /// The `SymbolManager` keeps the most recent external file cached, so that repeated
-    /// calls to `lookup_external` for the same external file are fast. If the set of
-    /// addresses for lookup is known ahead-of-time, sorting these addresses upfront can
-    /// achieve a very good hit rate.
-    pub async fn lookup_external(
-        &self,
-        symbol_file_origin: &SymbolFileOrigin,
-        address: &ExternalFileAddressRef,
-    ) -> Option<Vec<FrameDebugInfo>> {
-        self.helper_with_symbol_manager
-            .get()
-            .0
-            .lookup_external(symbol_file_origin, address)
-            .await
-    }
-
-    /// Manually load and return an external file with additional debug info.
-    /// This is a lower-level alternative to [`lookup_external`](SymbolManager::lookup_external)
-    /// and can be used if more control over caching is desired.
-    pub async fn load_external_file(
-        &self,
-        symbol_file_origin: &SymbolFileOrigin,
-        external_file_ref: &ExternalFileRef,
-    ) -> Result<ExternalFileSymbolMap, Error> {
-        self.helper_with_symbol_manager
-            .get()
-            .0
-            .load_external_file(symbol_file_origin, external_file_ref)
-            .await
-    }
-
-    /// Run a symbolication query with the "Tecken" JSON API.
-    #[cfg(feature = "api")]
-    pub async fn query_json_api(&self, path: &str, request_json: &str) -> String {
-        self.helper_with_symbol_manager
-            .get()
-            .0
-            .query_json_api(path, request_json)
-            .await
-    }
-}
-
-// Do a trait dance to create a covariant wrapper.
-// This is necessary because samply_symbols::SymbolManager has a generic parameter
-// `H: FileAndPathHelper<'h>` - the lifetime is named in the trait. And *that's*
-// only necessary because FileAndPathHelper's OpenFileFuture needs a lifetime
-// parameter. Starting with Rust 1.65, OpenFileFuture could use GATs for the lifetime
-// parameter, but we're keeping a lower MSRV for now. Maybe we can revisit this mid-2023.
-#[derive(Yokeable)]
-struct SymbolManagerWrapperTypeErased<'h>(Box<dyn SymbolManagerTrait + 'h + Send + Sync>);
-
-trait SymbolManagerTrait {
-    fn add_known_lib(&mut self, lib_info: LibraryInfo);
-
-    fn load_symbol_map<'a>(
-        &'a self,
-        debug_name: &'a str,
-        debug_id: DebugId,
-    ) -> Pin<Box<dyn Future<Output = Result<SymbolMap, Error>> + 'a + Send>>;
-
-    fn load_symbol_map_for_binary_at_path<'a>(
-        &'a self,
-        path: &'a Path,
-        disambiguator: Option<MultiArchDisambiguator>,
-    ) -> Pin<Box<dyn Future<Output = Result<SymbolMap, Error>> + 'a + Send>>;
-
-    fn lookup_external<'a>(
-        &'a self,
-        symbol_file_origin: &'a SymbolFileOrigin,
-        address: &'a ExternalFileAddressRef,
-    ) -> Pin<Box<dyn Future<Output = Option<Vec<FrameDebugInfo>>> + 'a + Send>>;
-
-    fn load_external_file<'a>(
-        &'a self,
-        symbol_file_origin: &'a SymbolFileOrigin,
-        external_file_ref: &'a ExternalFileRef,
-    ) -> Pin<Box<dyn Future<Output = Result<ExternalFileSymbolMap, Error>> + 'a + Send>>;
-
-    #[cfg(feature = "api")]
-    fn query_json_api<'a>(
-        &'a self,
-        path: &'a str,
-        request_json: &'a str,
-    ) -> Pin<Box<dyn Future<Output = String> + 'a + Send>>;
-}
-
-struct SymbolManagerWrapper<'h>(samply_symbols::SymbolManager<'h, Helper>);
-
-impl<'h> SymbolManagerWrapper<'h> {
-    async fn load_symbol_map_for_binary_at_path_impl(
-        &self,
-        path: &Path,
-        multi_arch_disambiguator: Option<MultiArchDisambiguator>,
-    ) -> Result<SymbolMap, Error> {
-        let library_info =
-            SymbolManager::library_info_for_binary_at_path(path, multi_arch_disambiguator).await?;
-        self.load_symbol_map(library_info).await
-    }
-
-    async fn load_symbol_map(&self, info: LibraryInfo) -> Result<SymbolMap, Error> {
-        Ok(SymbolMap(self.0.load_symbol_map(&info).await?))
-    }
-}
-
-impl<'h> SymbolManagerTrait for SymbolManagerWrapper<'h> {
-    fn add_known_lib(&mut self, lib_info: LibraryInfo) {
-        self.0.helper().add_known_lib(lib_info);
-    }
-
-    fn load_symbol_map<'a>(
-        &'a self,
-        debug_name: &'a str,
-        debug_id: DebugId,
-    ) -> Pin<Box<dyn Future<Output = Result<SymbolMap, Error>> + 'a + Send>> {
         let info = LibraryInfo {
             debug_name: Some(debug_name.to_string()),
             debug_id: Some(debug_id),
             ..Default::default()
         };
-        Box::pin(self.load_symbol_map(info))
+        Ok(SymbolMap(self.symbol_manager.load_symbol_map(&info).await?))
     }
 
-    fn load_symbol_map_for_binary_at_path<'a>(
-        &'a self,
-        path: &'a Path,
-        disambiguator: Option<MultiArchDisambiguator>,
-    ) -> Pin<Box<dyn Future<Output = Result<SymbolMap, Error>> + 'a + Send>> {
-        Box::pin(self.load_symbol_map_for_binary_at_path_impl(path, disambiguator))
+    /// Manually load and return an external file with additional debug info.
+    /// This is a lower-level alternative to [`lookup_external`](SymbolMap::lookup_external)
+    /// and can be used if more control over caching is desired.
+    pub async fn load_external_file(
+        &self,
+        symbol_file_origin: &SymbolFileOrigin,
+        external_file_path: &str,
+    ) -> Result<ExternalFileSymbolMap, Error> {
+        let symbol_map = self
+            .symbol_manager
+            .load_external_file(&symbol_file_origin.0, external_file_path)
+            .await?;
+        Ok(ExternalFileSymbolMap(symbol_map))
     }
 
-    fn lookup_external<'a>(
-        &'a self,
-        symbol_file_origin: &'a SymbolFileOrigin,
-        address: &'a ExternalFileAddressRef,
-    ) -> Pin<Box<dyn Future<Output = Option<Vec<FrameDebugInfo>>> + 'a + Send>> {
-        Box::pin(self.0.lookup_external(&symbol_file_origin.0, address))
-    }
-
-    fn load_external_file<'a>(
-        &'a self,
-        symbol_file_origin: &'a SymbolFileOrigin,
-        external_file_ref: &'a ExternalFileRef,
-    ) -> Pin<Box<dyn Future<Output = Result<ExternalFileSymbolMap, Error>> + 'a + Send>> {
-        Box::pin(
-            self.0
-                .load_external_file(&symbol_file_origin.0, external_file_ref),
-        )
-    }
-
+    /// Run a symbolication query with the "Tecken" JSON API.
     #[cfg(feature = "api")]
-    fn query_json_api<'a>(
-        &'a self,
-        path: &'a str,
-        request_json: &'a str,
-    ) -> Pin<Box<dyn Future<Output = String> + 'a + Send>> {
-        let api = samply_api::Api::new(&self.0);
-        let f = api.query_api(path, request_json);
-        Box::pin(f)
+    pub async fn query_json_api(&self, path: &str, request_json: &str) -> String {
+        let api = samply_api::Api::new(&self.symbol_manager);
+        api.query_api(path, request_json).await
     }
 }

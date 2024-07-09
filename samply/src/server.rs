@@ -1,55 +1,51 @@
-use flate2::read::GzDecoder;
-use hyper::body::Bytes;
-use hyper::server::conn::AddrIncoming;
-use hyper::server::Builder;
-use hyper::service::{make_service_fn, service_fn};
-use hyper::{header, Body, Request, Response, Server};
-use hyper::{Method, StatusCode};
-use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
-use rand::RngCore;
-use serde_derive::Deserialize;
-use tokio::io::AsyncReadExt;
-use wholesym::debugid::DebugId;
-use wholesym::{CodeId, LibraryInfo, SymbolManager, SymbolManagerConfig};
-
 use std::collections::HashMap;
-use std::convert::Infallible;
-use std::ffi::{OsStr, OsString};
-use std::io::BufReader;
-use std::net::SocketAddr;
+use std::ffi::OsStr;
+use std::net::{IpAddr, SocketAddr};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 
+use futures_util::TryStreamExt;
+use http_body_util::combinators::BoxBody;
+use http_body_util::{BodyExt, Either, StreamBody};
+use hyper::body::{Bytes, Frame};
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
+use hyper::{header, Method, Request, Response, StatusCode};
+use hyper_util::rt::TokioIo;
+use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
+use platform_dirs::AppDirs;
+use rand::RngCore;
+use tokio::net::TcpListener;
+use tokio_util::io::ReaderStream;
+use wholesym::debugid::DebugId;
+use wholesym::{LibraryInfo, SymbolManager, SymbolManagerConfig};
+
+use crate::name::SAMPLY_NAME;
+use crate::shared;
+use crate::shared::ctrl_c::CtrlC;
+use crate::shared::symbol_props::SymbolProps;
+
 #[derive(Clone, Debug)]
 pub struct ServerProps {
+    pub address: IpAddr,
     pub port_selection: PortSelection,
     pub verbose: bool,
     pub open_in_browser: bool,
 }
 
 #[tokio::main]
-pub async fn start_server_main(file: &Path, props: ServerProps) {
-    start_server(
-        Some(file),
-        props.port_selection,
-        props.verbose,
-        props.open_in_browser,
-    )
-    .await;
+pub async fn start_server_main(
+    file: &Path,
+    props: ServerProps,
+    symbol_props: SymbolProps,
+    libinfo_map: HashMap<(String, DebugId), LibraryInfo>,
+) {
+    start_server(Some(file), props, symbol_props, libinfo_map).await;
 }
 
 const BAD_CHARS: &AsciiSet = &CONTROLS.add(b':').add(b'/');
-
-#[test]
-fn test_is_send_and_sync() {
-    use symsrv::FileContents;
-    fn assert_is_send<T: Send>() {}
-    fn assert_is_sync<T: Sync>() {}
-    assert_is_send::<FileContents>();
-    assert_is_sync::<FileContents>();
-}
 
 #[derive(Clone, Debug)]
 pub enum PortSelection {
@@ -69,32 +65,72 @@ impl PortSelection {
     }
 }
 
+fn create_symbol_manager_config(symbol_props: SymbolProps, verbose: bool) -> SymbolManagerConfig {
+    let _config_dir = AppDirs::new(Some(SAMPLY_NAME), true).map(|dirs| dirs.config_dir);
+    let cache_base_dir = AppDirs::new(Some(SAMPLY_NAME), false).map(|dirs| dirs.cache_dir);
+    let cache_base_dir = cache_base_dir.as_deref();
+
+    let mut config = SymbolManagerConfig::new()
+        .verbose(verbose)
+        .respect_nt_symbol_path(true)
+        .use_debuginfod(std::env::var("SAMPLY_USE_DEBUGINFOD").is_ok())
+        .use_spotlight(true);
+
+    if let Some(cache_base_dir) = cache_base_dir {
+        config = config.debuginfod_cache_dir_if_not_installed(
+            cache_base_dir.join("symbols").join("debuginfod"),
+        );
+    }
+
+    // TODO: Read symbol server config from some kind of config file
+    // TODO: On Windows, put https://msdl.microsoft.com/download/symbols into the config file.
+
+    // Configure symbol servers and cache directories based on the information in the SymbolProps.
+
+    let breakpad_symbol_cache_dir = symbol_props
+        .breakpad_symbol_cache
+        .or_else(|| Some(cache_base_dir?.join("symbols").join("breakpad")));
+    if let Some(cache_dir) = breakpad_symbol_cache_dir {
+        for base_url in symbol_props.breakpad_symbol_server {
+            config = config.breakpad_symbols_server(base_url, &cache_dir)
+        }
+        for dir in symbol_props.breakpad_symbol_dir {
+            config = config.breakpad_symbols_dir(dir);
+        }
+        if let Some(cache_base_dir) = cache_base_dir {
+            let breakpad_symindex_cache_dir =
+                cache_base_dir.join("symbols").join("breakpad-symindex");
+            config = config.breakpad_symindex_cache_dir(breakpad_symindex_cache_dir);
+        }
+    }
+
+    let windows_symbol_cache_dir = symbol_props
+        .windows_symbol_cache
+        .or_else(|| Some(cache_base_dir?.join("symbols").join("windows")));
+    if let Some(cache_dir) = windows_symbol_cache_dir {
+        for base_url in symbol_props.windows_symbol_server {
+            config = config.windows_symbols_server(base_url, &cache_dir)
+        }
+    }
+
+    if let Some(binary_cache) = symbol_props.simpleperf_binary_cache {
+        config = config.simpleperf_binary_cache_dir(binary_cache);
+    }
+
+    for dir in symbol_props.symbol_dir {
+        config = config.extra_symbols_directory(dir);
+    }
+
+    config
+}
+
 async fn start_server(
     profile_filename: Option<&Path>,
-    port_selection: PortSelection,
-    verbose: bool,
-    open_in_browser: bool,
+    server_props: ServerProps,
+    symbol_props: SymbolProps,
+    libinfo_map: HashMap<(String, DebugId), LibraryInfo>,
 ) {
-    let libinfo_map = if let Some(profile_filename) = profile_filename {
-        // Read the profile.json file and parse it as JSON.
-        // Build a map (debugName, breakpadID) -> debugPath from the information
-        // in profile(\.processes\[\d+\])*(\.threads\[\d+\])?\.libs.
-        let file = std::fs::File::open(profile_filename).expect("couldn't read file");
-        let reader = BufReader::new(file);
-
-        // Handle .gz profiles
-        if profile_filename.extension() == Some(&OsString::from("gz")) {
-            let decoder = GzDecoder::new(reader);
-            let reader = BufReader::new(decoder);
-            parse_libinfo_map_from_profile(reader).expect("couldn't parse json")
-        } else {
-            parse_libinfo_map_from_profile(reader).expect("couldn't parse json")
-        }
-    } else {
-        HashMap::new()
-    };
-
-    let (builder, addr) = make_builder_at_port(port_selection);
+    let (listener, addr) = make_listener(server_props.address, server_props.port_selection).await;
 
     let token = generate_token();
     let path_prefix = format!("/{token}");
@@ -128,99 +164,55 @@ async fn start_server(
 
     let template_values = Arc::new(template_values);
 
-    let mut config = SymbolManagerConfig::new()
-        .verbose(verbose)
-        .respect_nt_symbol_path(true)
-        .default_nt_symbol_path("srv**https://msdl.microsoft.com/download/symbols")
-        .use_debuginfod(std::env::var("SAMPLY_USE_DEBUGINFOD").is_ok())
-        .use_spotlight(true);
-    if let Some(home_dir) = dirs::home_dir() {
-        config = config.debuginfod_cache_dir_if_not_installed(home_dir.join("sym"));
-    }
-    // TODO: Read breakpad symbol server config from some kind of config file, and call breakpad_symbols_server
-
+    let config = create_symbol_manager_config(symbol_props, server_props.verbose);
     let mut symbol_manager = SymbolManager::with_config(config);
     for lib_info in libinfo_map.into_values() {
         symbol_manager.add_known_library(lib_info);
     }
-    let symbol_manager = Arc::new(symbol_manager);
-    let new_service = make_service_fn(move |_conn| {
-        let symbol_manager = symbol_manager.clone();
-        let profile_filename = profile_filename.map(PathBuf::from);
-        let template_values = template_values.clone();
-        let path_prefix = path_prefix.clone();
-        async {
-            Ok::<_, Infallible>(service_fn(move |req| {
-                symbolication_service(
-                    req,
-                    template_values.clone(),
-                    symbol_manager.clone(),
-                    profile_filename.clone(),
-                    path_prefix.clone(),
-                )
-            }))
-        }
-    });
 
-    let server = builder.serve(new_service);
+    if let Some(profile_filename) = profile_filename {
+        let precog_filename = profile_filename.with_extension("syms.json");
+        if let Some(precog_info) =
+            shared::symbol_precog::PrecogSymbolInfo::try_load(&precog_filename)
+        {
+            for (debug_id, syms) in precog_info.into_hash_map().into_iter() {
+                let lib_info = LibraryInfo {
+                    debug_id: Some(debug_id),
+                    ..LibraryInfo::default()
+                };
+                symbol_manager.add_known_library_symbols(lib_info, syms);
+            }
+        }
+    }
+
+    let symbol_manager = Arc::new(symbol_manager);
+
+    let server = tokio::task::spawn(run_server(
+        listener,
+        symbol_manager,
+        profile_filename.map(PathBuf::from),
+        template_values,
+        path_prefix,
+    ));
 
     eprintln!("Local server listening at {server_origin}");
-    if !open_in_browser {
+    if !server_props.open_in_browser {
         if let Some(profiler_url) = &profiler_url {
             eprintln!("  Open the profiler at {profiler_url}");
         }
     }
     eprintln!("Press Ctrl+C to stop.");
 
-    if open_in_browser {
+    if server_props.open_in_browser {
         if let Some(profiler_url) = &profiler_url {
             let _ = opener::open_browser(profiler_url);
         }
     }
 
-    // Run this server for... forever!
+    // Run this server until it stops.
     if let Err(e) = server.await {
         eprintln!("server error: {e}");
     }
-}
-
-fn parse_libinfo_map_from_profile(
-    reader: impl std::io::Read,
-) -> Result<HashMap<(String, DebugId), LibraryInfo>, std::io::Error> {
-    let profile: ProfileJsonProcess = serde_json::from_reader(reader)?;
-    let mut libinfo_map = HashMap::new();
-    add_to_libinfo_map_recursive(&profile, &mut libinfo_map);
-    Ok(libinfo_map)
-}
-
-#[derive(Deserialize, Default, Clone, Debug, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-struct ProfileJsonProcess {
-    #[serde(default)]
-    pub libs: Vec<ProfileJsonLib>,
-    #[serde(default)]
-    pub threads: Vec<ProfileJsonThread>,
-    #[serde(default)]
-    pub processes: Vec<ProfileJsonProcess>,
-}
-
-#[derive(Deserialize, Default, Clone, Debug, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-struct ProfileJsonThread {
-    #[serde(default)]
-    pub libs: Vec<ProfileJsonLib>,
-}
-
-#[derive(Deserialize, Default, Clone, Debug, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-struct ProfileJsonLib {
-    pub debug_name: Option<String>,
-    pub debug_path: Option<String>,
-    pub name: Option<String>,
-    pub path: Option<String>,
-    pub breakpad_id: Option<String>,
-    pub code_id: Option<String>,
-    pub arch: Option<String>,
 }
 
 // Returns a base32 string for 24 random bytes.
@@ -230,12 +222,12 @@ fn generate_token() -> String {
     nix_base32::to_nix_base32(&bytes)
 }
 
-fn make_builder_at_port(port_selection: PortSelection) -> (Builder<AddrIncoming>, SocketAddr) {
+async fn make_listener(addr: IpAddr, port_selection: PortSelection) -> (TcpListener, SocketAddr) {
     match port_selection {
         PortSelection::OnePort(port) => {
-            let addr = SocketAddr::from(([127, 0, 0, 1], port));
-            match Server::try_bind(&addr) {
-                Ok(builder) => (builder, addr),
+            let addr = SocketAddr::from((addr, port));
+            match TcpListener::bind(&addr).await {
+                Ok(listener) => (listener, addr),
                 Err(e) => {
                     eprintln!("Could not bind to port {port}: {e}");
                     std::process::exit(1)
@@ -245,9 +237,9 @@ fn make_builder_at_port(port_selection: PortSelection) -> (Builder<AddrIncoming>
         PortSelection::TryMultiple(range) => {
             let mut error = None;
             for port in range.clone() {
-                let addr = SocketAddr::from(([127, 0, 0, 1], port));
-                match Server::try_bind(&addr) {
-                    Ok(builder) => return (builder, addr),
+                let addr = SocketAddr::from((addr, port));
+                match TcpListener::bind(&addr).await {
+                    Ok(listener) => return (listener, addr),
                     Err(e) => {
                         error.get_or_insert(e);
                     }
@@ -296,41 +288,90 @@ const TEMPLATE_WITHOUT_PROFILE: &str = r#"
 </ul>
 "#;
 
+async fn run_server(
+    listener: TcpListener,
+    symbol_manager: Arc<SymbolManager>,
+    profile_filename: Option<PathBuf>,
+    template_values: Arc<HashMap<&'static str, String>>,
+    path_prefix: String,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut ctrl_c_receiver = CtrlC::observe_oneshot();
+
+    // We start a loop to continuously accept incoming connections
+    loop {
+        let (stream, _) = tokio::select! {
+            stream_and_addr_res = listener.accept() => stream_and_addr_res?,
+            ctrl_c_result = &mut ctrl_c_receiver => {
+                return Ok(ctrl_c_result?);
+            }
+        };
+
+        // Use an adapter to access something implementing `tokio::io` traits as if they implement
+        // `hyper::rt` IO traits.
+        let io = TokioIo::new(stream);
+
+        let symbol_manager = symbol_manager.clone();
+        let profile_filename = profile_filename.clone();
+        let template_values = template_values.clone();
+        let path_prefix = path_prefix.clone();
+
+        // Spawn a tokio task to serve multiple connections concurrently
+        tokio::task::spawn(async move {
+            // Finally, we bind the incoming connection to our service
+            if let Err(err) = http1::Builder::new()
+                // `service_fn` converts our function in a `Service`
+                .serve_connection(
+                    io,
+                    service_fn(move |req| {
+                        symbolication_service(
+                            req,
+                            template_values.clone(),
+                            symbol_manager.clone(),
+                            profile_filename.clone(),
+                            path_prefix.clone(),
+                        )
+                    }),
+                )
+                .await
+            {
+                println!("Error serving connection: {:?}", err);
+            }
+        });
+    }
+}
+
 async fn symbolication_service(
-    req: Request<Body>,
+    req: Request<hyper::body::Incoming>,
     template_values: Arc<HashMap<&'static str, String>>,
     symbol_manager: Arc<SymbolManager>,
     profile_filename: Option<PathBuf>,
     path_prefix: String,
-) -> Result<Response<Body>, hyper::Error> {
+) -> Result<Response<Either<String, BoxBody<Bytes, std::io::Error>>>, hyper::Error> {
     let has_profile = profile_filename.is_some();
     let method = req.method();
     let path = req.uri().path();
-    let mut response = Response::new(Body::empty());
+    let mut response = Response::new(Either::Left(String::new()));
 
-    let path_without_prefix = match path.strip_prefix(&path_prefix) {
-        None => {
-            // The secret prefix was not part of the URL. Do not send CORS headers.
-            match (method, path) {
-                (&Method::GET, "/") => {
-                    response.headers_mut().insert(
-                        header::CONTENT_TYPE,
-                        header::HeaderValue::from_static("text/html"),
-                    );
-                    let template = match has_profile {
-                        true => TEMPLATE_WITH_PROFILE,
-                        false => TEMPLATE_WITHOUT_PROFILE,
-                    };
-                    *response.body_mut() =
-                        Body::from(substitute_template(template, &template_values));
-                }
-                _ => {
-                    *response.status_mut() = StatusCode::NOT_FOUND;
-                }
+    let Some(path_without_prefix) = path.strip_prefix(&path_prefix) else {
+        // The secret prefix was not part of the URL. Do not send CORS headers.
+        match (method, path) {
+            (&Method::GET, "/") => {
+                response.headers_mut().insert(
+                    header::CONTENT_TYPE,
+                    header::HeaderValue::from_static("text/html"),
+                );
+                let template = match has_profile {
+                    true => TEMPLATE_WITH_PROFILE,
+                    false => TEMPLATE_WITHOUT_PROFILE,
+                };
+                *response.body_mut() =
+                    Either::Left(substitute_template(template, &template_values));
             }
-            return Ok(response);
+            _ => {
+                *response.status_mut() = StatusCode::NOT_FOUND;
+            }
         }
-        Some(path_without_prefix) => path_without_prefix,
+        return Ok(response);
     };
 
     // If we get here, then the secret prefix was part of the URL.
@@ -386,32 +427,18 @@ async fn symbolication_service(
                 header::CONTENT_TYPE,
                 header::HeaderValue::from_static("application/json; charset=UTF-8"),
             );
-            let (mut sender, body) = Body::channel();
-            *response.body_mut() = body;
 
-            // Stream the file out to the response body, asynchronously, after this function has returned.
-            tokio::spawn(async move {
-                let mut file = tokio::fs::File::open(&profile_filename)
-                    .await
-                    .expect("couldn't open profile file");
-                let mut contents = vec![0; 1024 * 1024];
-                loop {
-                    let data_len = file
-                        .read(&mut contents)
-                        .await
-                        .expect("couldn't read profile file");
-                    if data_len == 0 {
-                        break;
-                    }
-                    let send_result = sender
-                        .send_data(Bytes::copy_from_slice(&contents[..data_len]))
-                        .await;
-                    if send_result.is_err() {
-                        // The other side may have closed the channel. Stop sending.
-                        break;
-                    }
-                }
-            });
+            // Stream the file. This follows the send_file example from the hyper repo.
+            // https://github.com/hyperium/hyper/blob/7206fe30302937075c51c16a69d1eb3bbce6a671/examples/send_file.rs
+            let file = tokio::fs::File::open(&profile_filename)
+                .await
+                .expect("couldn't open profile file");
+
+            // Wrap in a tokio_util::io::ReaderStream
+            let reader_stream = ReaderStream::new(file);
+
+            let stream_body = StreamBody::new(reader_stream.map_ok(Frame::data));
+            *response.body_mut() = Either::Right(stream_body.boxed());
         }
         (&Method::POST, path, _) => {
             response.headers_mut().insert(
@@ -419,12 +446,14 @@ async fn symbolication_service(
                 header::HeaderValue::from_static("application/json"),
             );
             let path = path.to_string();
-            // Await the full body to be concatenated into a single `Bytes`...
-            let full_body = hyper::body::to_bytes(req.into_body()).await?;
-            let full_body = String::from_utf8(full_body.to_vec()).expect("invalid utf-8");
+            // Await the full body to be concatenated into a `Collected<Bytes>`.
+            let full_body = req.into_body().collect().await?;
+            // Convert the `Collected<Bytes>` into a `String`.
+            let full_body =
+                String::from_utf8(full_body.to_bytes().to_vec()).expect("invalid utf-8");
             let response_json = symbol_manager.query_json_api(&path, &full_body).await;
 
-            *response.body_mut() = response_json.into();
+            *response.body_mut() = Either::Left(response_json);
         }
         _ => {
             *response.status_mut() = StatusCode::NOT_FOUND;
@@ -440,81 +469,4 @@ fn substitute_template(template: &str, template_values: &HashMap<&'static str, S
         s = s.replace(key, value);
     }
     s
-}
-
-fn add_libs_to_libinfo_map(
-    libs: &[ProfileJsonLib],
-    libinfo_map: &mut HashMap<(String, DebugId), LibraryInfo>,
-) {
-    for lib in libs {
-        if let Some(lib_info) = libinfo_map_entry_for_lib(lib) {
-            // If libinfo_map_entry_for_lib returns Some(), debug_name and debug_id are guaranteed to be Some().
-            let debug_name = lib_info.debug_name.clone().unwrap();
-            let debug_id = lib_info.debug_id.unwrap();
-            libinfo_map.insert((debug_name, debug_id), lib_info);
-        }
-    }
-}
-
-fn libinfo_map_entry_for_lib(lib: &ProfileJsonLib) -> Option<LibraryInfo> {
-    let debug_name = lib.debug_name.clone()?;
-    let breakpad_id = lib.breakpad_id.as_ref()?;
-    let debug_path = lib.debug_path.clone();
-    let name = lib.name.clone();
-    let path = lib.path.clone();
-    let debug_id = DebugId::from_breakpad(breakpad_id).ok()?;
-    let code_id = lib
-        .code_id
-        .as_deref()
-        .and_then(|ci| CodeId::from_str(ci).ok());
-    let arch = lib.arch.clone();
-    let lib_info = LibraryInfo {
-        debug_id: Some(debug_id),
-        debug_name: Some(debug_name),
-        debug_path,
-        name,
-        code_id,
-        path,
-        arch,
-    };
-    Some(lib_info)
-}
-
-fn add_to_libinfo_map_recursive(
-    profile: &ProfileJsonProcess,
-    libinfo_map: &mut HashMap<(String, DebugId), LibraryInfo>,
-) {
-    add_libs_to_libinfo_map(&profile.libs, libinfo_map);
-    for thread in &profile.threads {
-        add_libs_to_libinfo_map(&thread.libs, libinfo_map);
-    }
-    for process in &profile.processes {
-        add_to_libinfo_map_recursive(process, libinfo_map);
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use super::*;
-
-    #[test]
-    fn deserialize_profile_json() {
-        let p: ProfileJsonProcess = serde_json::from_str("{}").unwrap();
-        assert!(p.libs.is_empty());
-        assert!(p.threads.is_empty());
-        assert!(p.processes.is_empty());
-
-        let p: ProfileJsonProcess = serde_json::from_str("{\"unknown_field\":[1, 2, 3]}").unwrap();
-        assert!(p.libs.is_empty());
-        assert!(p.threads.is_empty());
-        assert!(p.processes.is_empty());
-
-        let p: ProfileJsonProcess =
-            serde_json::from_str("{\"threads\":[{\"libs\":[{}]}]}").unwrap();
-        assert!(p.libs.is_empty());
-        assert_eq!(p.threads.len(), 1);
-        assert_eq!(p.threads[0].libs.len(), 1);
-        assert_eq!(p.threads[0].libs[0], ProfileJsonLib::default());
-        assert!(p.processes.is_empty());
-    }
 }

@@ -1,4 +1,16 @@
+use std::cmp::Ordering;
+use std::collections::HashMap;
+use std::ops::{Deref, Range};
+use std::{mem, ptr};
+
 use dyld_bindings::{dyld_all_image_infos, dyld_image_info};
+#[cfg(target_arch = "aarch64")]
+use framehop::aarch64::PtrAuthMask;
+#[cfg(target_arch = "aarch64")]
+use framehop::aarch64::UnwindRegsAarch64;
+#[cfg(target_arch = "x86_64")]
+use framehop::x86_64::UnwindRegsX86_64;
+use framehop::{FrameAddress, UnwindRegsNative};
 use fxprof_processed_profile::debugid::DebugId;
 use mach::message::mach_msg_type_number_t;
 use mach::port::mach_port_t;
@@ -14,6 +26,8 @@ use mach::vm_inherit::VM_INHERIT_SHARE;
 use mach::vm_page_size::{mach_vm_trunc_page, vm_page_size};
 use mach::vm_prot::{vm_prot_t, VM_PROT_NONE, VM_PROT_READ};
 use mach::vm_types::{mach_vm_address_t, mach_vm_size_t};
+#[cfg(target_arch = "x86_64")]
+use mach::{structs::x86_thread_state64_t, thread_status::x86_THREAD_STATE64};
 use object::macho::{
     MachHeader64, SegmentCommand64, CPU_SUBTYPE_ARM64E, CPU_SUBTYPE_ARM64_ALL, CPU_SUBTYPE_MASK,
     CPU_SUBTYPE_X86_64_ALL, CPU_SUBTYPE_X86_64_H, CPU_TYPE_ARM64, CPU_TYPE_X86_64, MH_EXECUTE,
@@ -22,26 +36,9 @@ use object::read::macho::{MachHeader, Section, Segment};
 use object::LittleEndian;
 #[cfg(target_arch = "aarch64")]
 use once_cell::sync::Lazy;
+use uuid::Uuid;
 use wholesym::samply_symbols::object;
 use wholesym::CodeId;
-
-use std::cmp::Ordering;
-use std::collections::HashMap;
-use std::mem;
-use std::ops::{Deref, Range};
-use std::ptr;
-use uuid::Uuid;
-
-#[cfg(target_arch = "aarch64")]
-use framehop::aarch64::PtrAuthMask;
-#[cfg(target_arch = "aarch64")]
-use framehop::aarch64::UnwindRegsAarch64;
-#[cfg(target_arch = "x86_64")]
-use framehop::x86_64::UnwindRegsX86_64;
-use framehop::{FrameAddress, UnwindRegsNative};
-
-#[cfg(target_arch = "x86_64")]
-use mach::{structs::x86_thread_state64_t, thread_status::x86_THREAD_STATE64};
 
 use super::dyld_bindings::{self};
 use super::error::SamplingError;
@@ -50,24 +47,29 @@ use super::task_profiler::UnwindSectionBytes;
 
 pub const TASK_DYLD_INFO_COUNT: mach_msg_type_number_t = 5;
 
-#[derive(Debug, Clone)]
-pub struct ThreadInfo {
-    pub tid: u64,
-    pub name: String,
-    pub backtrace: Option<Vec<u64>>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DyldInfo {
     pub is_executable: bool,
     pub file: String,
     pub base_avma: u64,
     pub vmsize: u64,
-    pub svma_info: framehop::ModuleSvmaInfo,
+    pub module_info: ModuleSvmaInfo,
     pub debug_id: Option<DebugId>,
     pub code_id: Option<CodeId>,
     pub arch: Option<&'static str>,
     pub unwind_sections: UnwindSectionInfo,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleSvmaInfo {
+    pub base_svma: u64,
+    pub text_svma: Option<Range<u64>>,
+    pub stubs_svma: Option<Range<u64>>,
+    pub stub_helper_svma: Option<Range<u64>>,
+    pub got_svma: Option<Range<u64>>,
+    pub eh_frame_svma: Option<Range<u64>>,
+    pub eh_frame_hdr_svma: Option<Range<u64>>,
+    pub text_segment_svma: Option<Range<u64>>,
 }
 
 /// These are SVMAs.
@@ -309,15 +311,15 @@ fn get_dyld_image_info(
         file: filename,
         base_avma,
         vmsize,
-        svma_info: framehop::ModuleSvmaInfo {
+        module_info: ModuleSvmaInfo {
             base_svma,
-            text: section_svma_range(b"__text"),
-            text_env: section_svma_range(b"text_env"),
-            stubs: section_svma_range(b"__stubs"),
-            stub_helper: section_svma_range(b"__stub_helper"),
-            eh_frame: section_svma_range(b"__eh_frame"),
-            eh_frame_hdr: section_svma_range(b"__eh_frame_hdr"),
-            got: section_svma_range(b"__got"),
+            text_svma: section_svma_range(b"__text"),
+            stubs_svma: section_svma_range(b"__stubs"),
+            stub_helper_svma: section_svma_range(b"__stub_helper"),
+            got_svma: section_svma_range(b"__got"),
+            eh_frame_svma: section_svma_range(b"__eh_frame"),
+            eh_frame_hdr_svma: section_svma_range(b"__eh_frame_hdr"),
+            text_segment_svma: Some(base_svma..base_svma + vmsize),
         },
         debug_id: uuid.map(DebugId::from_uuid),
         code_id: uuid.map(CodeId::MachoUuid),
@@ -334,6 +336,7 @@ fn get_dyld_image_info(
 // bindgen seemed to put all the members for this struct as a single opaque blob:
 //      (bindgen /usr/include/mach/task_info.h --with-derive-default --whitelist-type task_dyld_info)
 // rather than debug the bindgen command, just define manually here
+#[allow(non_camel_case_types)]
 #[repr(C)]
 #[derive(Default, Debug)]
 pub struct task_dyld_info {
@@ -342,6 +345,7 @@ pub struct task_dyld_info {
     pub all_image_info_format: mach::vm_types::integer_t,
 }
 
+#[allow(non_camel_case_types)]
 #[cfg(target_arch = "aarch64")]
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, Hash, PartialOrd, PartialEq, Eq, Ord)]
@@ -392,6 +396,49 @@ fn read_int_sysctl_by_name(name: &str) -> Result<i32, sysctl::SysctlError> {
     let val = sysctl::Ctl::new(name)?.value()?;
     let val = *val.as_int().ok_or(sysctl::SysctlError::ExtractionError)?;
     Ok(val)
+}
+
+pub fn proc_cmdline(pid: i32) -> Result<Vec<String>, sysctl::SysctlError> {
+    unsafe {
+        let mib: [i32; 3] = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+        let args: [u8; 65536] = std::mem::zeroed();
+        let size: usize = std::mem::size_of_val(&args);
+        let ret = libc::sysctl(
+            &mib as *const _ as *mut _,
+            3,
+            &args as *const _ as *mut _,
+            &size as *const _ as *mut _,
+            std::ptr::null_mut(),
+            0,
+        );
+
+        if ret < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+
+        // get the number of arguments
+        let argcount: i32 = *(&args as *const _ as *const i32);
+        let args = &args[std::mem::size_of_val(&argcount)..];
+
+        // split off of the exe from the beginning
+        let args = &args[libc::strlen(args as *const _ as *const i8)..];
+
+        let mut ret = Vec::new();
+        for arg in args.split(|b| *b == 0) {
+            // ignore leading nulls
+            if arg.is_empty() && ret.is_empty() {
+                continue;
+            }
+
+            let arg = String::from_utf8(arg.to_vec()).map_err(|e| e.utf8_error())?;
+
+            ret.push(arg);
+            if ret.len() >= argcount as usize {
+                break;
+            }
+        }
+        Ok(ret)
+    }
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -452,7 +499,7 @@ fn with_suspended_thread<R>(
 
 pub struct StackwalkerRef<'a> {
     unwinder: &'a framehop::UnwinderNative<UnwindSectionBytes, framehop::MayAllocateDuringUnwind>,
-    cache: &'a mut framehop::CacheNative<UnwindSectionBytes, framehop::MayAllocateDuringUnwind>,
+    cache: &'a mut framehop::CacheNative<framehop::MayAllocateDuringUnwind>,
 }
 
 impl<'a> StackwalkerRef<'a> {
@@ -461,7 +508,7 @@ impl<'a> StackwalkerRef<'a> {
             UnwindSectionBytes,
             framehop::MayAllocateDuringUnwind,
         >,
-        cache: &'a mut framehop::CacheNative<UnwindSectionBytes, framehop::MayAllocateDuringUnwind>,
+        cache: &'a mut framehop::CacheNative<framehop::MayAllocateDuringUnwind>,
     ) -> Self {
         Self { unwinder, cache }
     }
@@ -545,7 +592,7 @@ fn do_stackwalk(
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ForeignMemory {
     task: mach_port_t,
     data: Vec<VmData>,
@@ -617,6 +664,7 @@ impl ForeignMemory {
     }
 }
 
+#[derive(Debug)]
 pub struct VmSubData {
     page_aligned_data: VmData,
     address_range: std::ops::Range<u64>,
@@ -652,7 +700,7 @@ impl Deref for VmSubData {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct VmData {
     address_range: std::ops::Range<u64>,
     data: *mut u8,

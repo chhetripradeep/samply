@@ -1,19 +1,30 @@
-use crate::binary_image::BinaryImageInner;
-use crate::error::Error;
-use crate::shared::{FileAndPathHelper, FileContents, FileContentsWrapper, RangeReadRef};
-use crate::symbol_map::{
-    GenericSymbolMap, SymbolMap, SymbolMapDataMidTrait, SymbolMapDataOuterTrait,
-};
-use crate::symbol_map_object::{FunctionAddressesComputer, ObjectSymbolMapDataMid};
-use crate::{debug_id_for_object, BinaryImage, FileLocation, MultiArchDisambiguator};
+use std::marker::PhantomData;
+use std::sync::Arc;
+
 use debugid::DebugId;
 use macho_unwind_info::UnwindInfo;
-use object::macho::{self, FatHeader, LinkeditDataCommand, MachHeader32, MachHeader64};
-use object::read::macho::{FatArch, LoadCommandIterator, MachHeader};
+use object::macho::{self, LinkeditDataCommand, MachHeader32, MachHeader64};
+use object::read::macho::{
+    FatArch, LoadCommandIterator, MachHeader, MachOFatFile32, MachOFatFile64,
+};
 use object::read::{File, Object, ObjectSection};
 use object::{Endianness, FileKind, ReadRef};
-use std::marker::PhantomData;
 use uuid::Uuid;
+use yoke::Yoke;
+use yoke_derive::Yokeable;
+
+use crate::binary_image::{BinaryImage, BinaryImageInner};
+use crate::debugid_util::debug_id_for_object;
+use crate::dwarf::Addr2lineContextData;
+use crate::error::Error;
+use crate::shared::{
+    FileAndPathHelper, FileContents, FileContentsWrapper, FileLocation, MultiArchDisambiguator,
+    RangeReadRef,
+};
+use crate::symbol_map::SymbolMap;
+use crate::symbol_map_object::{
+    ObjectSymbolMap, ObjectSymbolMapInnerWrapper, ObjectSymbolMapOuter,
+};
 
 /// Converts a cpu type/subtype pair into the architecture name.
 ///
@@ -155,7 +166,10 @@ impl FatArchiveMember {
                         _ => None,
                     }
                     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-                    None
+                    {
+                        let _ = arch;
+                        None
+                    }
                 } else {
                     None
                 }
@@ -176,29 +190,29 @@ pub fn get_fat_archive_members(
     archive_kind: FileKind,
 ) -> Result<Vec<FatArchiveMember>, Error> {
     if archive_kind == FileKind::MachOFat64 {
-        let arches = FatHeader::parse_arch64(file_contents)
+        let fat_file = MachOFatFile64::parse(file_contents)
             .map_err(|e| Error::ObjectParseError(archive_kind, e))?;
-        get_fat_archive_members_impl(file_contents, arches)
+        get_fat_archive_members_impl(file_contents, fat_file.arches())
     } else {
-        let arches = FatHeader::parse_arch32(file_contents)
+        let fat_file = MachOFatFile32::parse(file_contents)
             .map_err(|e| Error::ObjectParseError(archive_kind, e))?;
-        get_fat_archive_members_impl(file_contents, arches)
+        get_fat_archive_members_impl(file_contents, fat_file.arches())
     }
 }
 
-struct DyldCacheLoader<'a, 'h, H>
+struct DyldCacheLoader<'a, H>
 where
-    H: FileAndPathHelper<'h>,
+    H: FileAndPathHelper,
 {
-    helper: &'h H,
+    helper: &'a H,
     dyld_cache_path: &'a H::FL,
 }
 
-impl<'a, 'h, H, F> DyldCacheLoader<'a, 'h, H>
+impl<'a, H, F> DyldCacheLoader<'a, H>
 where
-    H: FileAndPathHelper<'h, F = F>,
+    H: FileAndPathHelper<F = F>,
 {
-    pub fn new(helper: &'h H, dyld_cache_path: &'a H::FL) -> Self {
+    pub fn new(helper: &'a H, dyld_cache_path: &'a H::FL) -> Self {
         Self {
             helper,
             dyld_cache_path,
@@ -224,13 +238,13 @@ where
     }
 }
 
-async fn load_file_data_for_dyld_cache<'h, H, F>(
+async fn load_file_data_for_dyld_cache<H, F>(
     dyld_cache_path: H::FL,
     dylib_path: String,
-    helper: &'h H,
+    helper: &H,
 ) -> Result<DyldCacheFileData<F>, Error>
 where
-    H: FileAndPathHelper<'h, F = F>,
+    H: FileAndPathHelper<F = F>,
     F: FileContents + 'static,
 {
     let dcl = DyldCacheLoader::new(helper, &dyld_cache_path);
@@ -262,32 +276,63 @@ where
     ))
 }
 
-pub async fn load_symbol_map_for_dyld_cache<'h, H, FL>(
+pub async fn load_symbol_map_for_dyld_cache<H>(
     dyld_cache_path: H::FL,
     dylib_path: String,
-    helper: &'h H,
-) -> Result<SymbolMap<FL>, Error>
+    helper: &H,
+) -> Result<SymbolMap<H>, Error>
 where
-    H: FileAndPathHelper<'h, FL = FL>,
-    FL: FileLocation,
+    H: FileAndPathHelper,
 {
     let owner = load_file_data_for_dyld_cache(dyld_cache_path.clone(), dylib_path, helper).await?;
-    let symbol_map = GenericSymbolMap::new(owner)?;
-    Ok(SymbolMap::new(dyld_cache_path, Box::new(symbol_map)))
+    let owner = FileDataAndObject::new(Box::new(owner))?;
+    let symbol_map = ObjectSymbolMap::new(owner)?;
+    Ok(SymbolMap::new_plain(dyld_cache_path, Box::new(symbol_map)))
 }
 
 pub struct DyldCacheFileData<T>
 where
     T: FileContents + 'static,
 {
-    pub(crate) root_file_data: FileContentsWrapper<T>,
-    pub(crate) subcache_file_data: Vec<FileContentsWrapper<T>>,
-    pub(crate) dylib_path: String,
+    root_file_data: FileContentsWrapper<T>,
+    subcache_file_data: Vec<FileContentsWrapper<T>>,
+    dylib_path: String,
 }
 
+type FileContentsRange<'data, T> = RangeReadRef<'data, &'data FileContentsWrapper<T>>;
+
+#[derive(Yokeable)]
 pub struct ObjectAndMachOData<'data, T: FileContents + 'static> {
-    pub object: File<'data, RangeReadRef<'data, &'data FileContentsWrapper<T>>>,
-    pub macho_data: MachOData<'data, RangeReadRef<'data, &'data FileContentsWrapper<T>>>,
+    object: File<'data, FileContentsRange<'data, T>>,
+    macho_data: MachOData<'data, FileContentsRange<'data, T>>,
+    addr2line_context: Addr2lineContextData,
+}
+
+impl<'data, T: FileContents + 'static> ObjectAndMachOData<'data, T> {
+    pub fn new(
+        object: File<'data, FileContentsRange<'data, T>>,
+        macho_data: MachOData<'data, FileContentsRange<'data, T>>,
+    ) -> Self {
+        Self {
+            object,
+            macho_data,
+            addr2line_context: Addr2lineContextData::new(),
+        }
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        File<'data, FileContentsRange<'data, T>>,
+        MachOData<'data, FileContentsRange<'data, T>>,
+    ) {
+        (self.object, self.macho_data)
+    }
+}
+
+trait MakeMachObject<T: FileContents + 'static> {
+    fn file_data(&self) -> RangeReadRef<'_, &'_ FileContentsWrapper<T>>;
+    fn make_dependent_object(&self) -> Result<ObjectAndMachOData<'_, T>, Error>;
 }
 
 impl<T: FileContents + 'static> DyldCacheFileData<T> {
@@ -328,98 +373,108 @@ impl<T: FileContents + 'static> DyldCacheFileData<T> {
             .image_data_and_offset()
             .map_err(Error::MachOHeaderParseError)?;
         let macho_data = MachOData::new(data, header_offset, object.is_64());
-        Ok(ObjectAndMachOData { object, macho_data })
+        Ok(ObjectAndMachOData::new(object, macho_data))
     }
 }
 
-impl<T: FileContents + 'static> SymbolMapDataOuterTrait for DyldCacheFileData<T> {
-    fn make_symbol_map_data_mid(
-        &self,
-    ) -> Result<Box<dyn SymbolMapDataMidTrait + Send + '_>, Error> {
-        let ObjectAndMachOData { object, macho_data } = self.make_object()?;
-        let arch = macho_data.get_arch();
-        let function_addresses_computer = MachOFunctionAddressesComputer { macho_data };
-        let debug_id = debug_id_for_object(&object)
-            .ok_or(Error::InvalidInputError("debug ID cannot be read"))?;
-        let object = ObjectSymbolMapDataMid::new(
+impl<T: FileContents + 'static> MakeMachObject<T> for DyldCacheFileData<T> {
+    fn file_data(&self) -> RangeReadRef<'_, &'_ FileContentsWrapper<T>> {
+        self.root_file_data.full_range()
+    }
+    fn make_dependent_object(&self) -> Result<ObjectAndMachOData<'_, T>, Error> {
+        self.make_object()
+    }
+}
+
+struct FileDataAndObject<T: FileContents + 'static>(
+    Yoke<ObjectAndMachOData<'static, T>, Box<dyn MakeMachObject<T> + Send + Sync>>,
+);
+
+impl<T: FileContents + 'static> FileDataAndObject<T> {
+    pub fn new(data: Box<dyn MakeMachObject<T> + Send + Sync>) -> Result<Self, Error> {
+        let owner_and_object = Yoke::try_attach_to_cart(data, |data| data.make_dependent_object())?;
+        Ok(Self(owner_and_object))
+    }
+}
+
+impl<T: FileContents + 'static> ObjectSymbolMapOuter<T> for FileDataAndObject<T> {
+    fn make_symbol_map_inner(&self) -> Result<ObjectSymbolMapInnerWrapper<'_, T>, Error> {
+        let ObjectAndMachOData {
             object,
+            macho_data,
+            addr2line_context,
+        } = self.0.get();
+        let (function_starts, function_ends) = compute_function_addresses_macho(macho_data, object);
+        let debug_id = debug_id_for_object(object)
+            .ok_or(Error::InvalidInputError("debug ID cannot be read"))?;
+        let symbol_map = ObjectSymbolMapInnerWrapper::new(
+            object,
+            addr2line_context
+                .make_context(macho_data.data, object, None, None)
+                .ok(),
             None,
-            function_addresses_computer,
-            self.root_file_data.full_range(),
-            None,
-            arch,
             debug_id,
+            function_starts.as_deref(),
+            function_ends.as_deref(),
+            &(),
         );
 
-        Ok(Box::new(object))
+        Ok(symbol_map)
     }
 }
 
-pub fn get_symbol_map_for_macho<F: FileContents + 'static, FL: FileLocation>(
-    debug_file_location: FL,
-    file_contents: FileContentsWrapper<F>,
-) -> Result<SymbolMap<FL>, Error> {
-    let owner = MachSymbolMapData::new(file_contents);
-    let symbol_map = GenericSymbolMap::new(owner)?;
-    Ok(SymbolMap::new(debug_file_location, Box::new(symbol_map)))
+pub fn get_symbol_map_for_macho<H: FileAndPathHelper>(
+    debug_file_location: H::FL,
+    file_contents: FileContentsWrapper<H::F>,
+    helper: Arc<H>,
+) -> Result<SymbolMap<H>, Error> {
+    let owner = FileDataAndObject::new(Box::new(MachSymbolMapData(file_contents)))?;
+    let symbol_map = ObjectSymbolMap::new(owner)?;
+    Ok(SymbolMap::new_with_external_file_support(
+        debug_file_location,
+        Box::new(symbol_map),
+        helper,
+    ))
 }
 
-pub fn get_symbol_map_for_fat_archive_member<F: FileContents + 'static, FL: FileLocation>(
-    debug_file_location: FL,
-    file_contents: FileContentsWrapper<F>,
+pub fn get_symbol_map_for_fat_archive_member<H: FileAndPathHelper>(
+    debug_file_location: H::FL,
+    file_contents: FileContentsWrapper<H::F>,
     member: FatArchiveMember,
-) -> Result<SymbolMap<FL>, Error> {
+    helper: Arc<H>,
+) -> Result<SymbolMap<H>, Error> {
     let (start_offset, range_size) = member.offset_and_size;
     let owner =
         MachOFatArchiveMemberData::new(file_contents, start_offset, range_size, member.arch);
-    let symbol_map = GenericSymbolMap::new(owner)?;
-    Ok(SymbolMap::new(debug_file_location, Box::new(symbol_map)))
+    let owner = FileDataAndObject::new(Box::new(owner))?;
+    let symbol_map = ObjectSymbolMap::new(owner)?;
+    Ok(SymbolMap::new_with_external_file_support(
+        debug_file_location,
+        Box::new(symbol_map),
+        helper,
+    ))
 }
 
-struct MachSymbolMapData<T>
-where
-    T: FileContents,
-{
+struct MachSymbolMapData<T: FileContents>(FileContentsWrapper<T>);
+
+impl<T: FileContents + 'static> MakeMachObject<T> for MachSymbolMapData<T> {
+    fn file_data(&self) -> RangeReadRef<'_, &'_ FileContentsWrapper<T>> {
+        self.0.full_range()
+    }
+
+    fn make_dependent_object(&self) -> Result<ObjectAndMachOData<'_, T>, Error> {
+        let file_data = self.file_data();
+        let object = File::parse(file_data).map_err(Error::MachOHeaderParseError)?;
+        let macho_data = MachOData::new(file_data, 0, object.is_64());
+        Ok(ObjectAndMachOData::new(object, macho_data))
+    }
+}
+
+pub struct MachOFatArchiveMemberData<T: FileContents> {
     file_data: FileContentsWrapper<T>,
-}
-
-impl<T: FileContents> MachSymbolMapData<T> {
-    pub fn new(file_data: FileContentsWrapper<T>) -> Self {
-        Self { file_data }
-    }
-}
-
-impl<T: FileContents + 'static> SymbolMapDataOuterTrait for MachSymbolMapData<T> {
-    fn make_symbol_map_data_mid(
-        &self,
-    ) -> Result<Box<dyn SymbolMapDataMidTrait + Send + '_>, Error> {
-        let macho_file = File::parse(&self.file_data).map_err(Error::MachOHeaderParseError)?;
-        let macho_data = MachOData::new(&self.file_data, 0, macho_file.is_64());
-        let arch = macho_data.get_arch();
-        let function_addresses_computer = MachOFunctionAddressesComputer { macho_data };
-        let debug_id = debug_id_for_object(&macho_file)
-            .ok_or(Error::InvalidInputError("debug ID cannot be read"))?;
-        let object = ObjectSymbolMapDataMid::new(
-            macho_file,
-            None,
-            function_addresses_computer,
-            &self.file_data,
-            None,
-            arch,
-            debug_id,
-        );
-        Ok(Box::new(object))
-    }
-}
-
-pub struct MachOFatArchiveMemberData<T>
-where
-    T: FileContents,
-{
-    pub(crate) file_data: FileContentsWrapper<T>,
-    pub(crate) start_offset: u64,
-    pub(crate) range_size: u64,
-    pub(crate) arch: Option<String>,
+    start_offset: u64,
+    range_size: u64,
+    arch: Option<String>,
 }
 
 impl<T: FileContents> MachOFatArchiveMemberData<T> {
@@ -441,40 +496,32 @@ impl<T: FileContents> MachOFatArchiveMemberData<T> {
         let file_contents_ref = &self.file_data;
         file_contents_ref.range(self.start_offset, self.range_size)
     }
-}
 
-impl<T: FileContents + 'static> SymbolMapDataOuterTrait for MachOFatArchiveMemberData<T> {
-    fn make_symbol_map_data_mid(
-        &self,
-    ) -> Result<Box<dyn SymbolMapDataMidTrait + Send + '_>, Error> {
-        let range_data = self.data();
-        let macho_file = File::parse(range_data).map_err(Error::MachOHeaderParseError)?;
-        let macho_data = MachOData::new(range_data, 0, macho_file.is_64());
-        let arch = macho_data.get_arch();
-        let function_addresses_computer = MachOFunctionAddressesComputer { macho_data };
-        let debug_id = debug_id_for_object(&macho_file)
-            .ok_or(Error::InvalidInputError("debug ID cannot be read"))?;
-        let object = ObjectSymbolMapDataMid::new(
-            macho_file,
-            None,
-            function_addresses_computer,
-            range_data,
-            None,
-            arch,
-            debug_id,
-        );
-        Ok(Box::new(object))
+    pub fn arch(&self) -> Option<String> {
+        self.arch.clone()
     }
 }
 
-pub async fn load_binary_from_dyld_cache<'h, F, H>(
+impl<T: FileContents + 'static> MakeMachObject<T> for MachOFatArchiveMemberData<T> {
+    fn file_data(&self) -> RangeReadRef<'_, &'_ FileContentsWrapper<T>> {
+        self.data()
+    }
+
+    fn make_dependent_object(&self) -> Result<ObjectAndMachOData<'_, T>, Error> {
+        let object = File::parse(self.file_data()).map_err(Error::MachOHeaderParseError)?;
+        let macho_data = MachOData::new(self.file_data(), 0, object.is_64());
+        Ok(ObjectAndMachOData::new(object, macho_data))
+    }
+}
+
+pub async fn load_binary_from_dyld_cache<F, H>(
     dyld_cache_path: H::FL,
     dylib_path: String,
-    helper: &'h H,
+    helper: &H,
 ) -> Result<BinaryImage<F>, Error>
 where
     F: FileContents + 'static,
-    H: FileAndPathHelper<'h, F = F>,
+    H: FileAndPathHelper<F = F>,
 {
     let file_data =
         load_file_data_for_dyld_cache(dyld_cache_path, dylib_path.clone(), helper).await?;
@@ -487,41 +534,34 @@ where
     Ok(image)
 }
 
-struct MachOFunctionAddressesComputer<'data, R: ReadRef<'data>> {
-    macho_data: MachOData<'data, R>,
-}
-
-impl<'data, R: ReadRef<'data>> FunctionAddressesComputer<'data>
-    for MachOFunctionAddressesComputer<'data, R>
+fn compute_function_addresses_macho<'data, O, R>(
+    macho_data: &MachOData<'data, R>,
+    object_file: &O,
+) -> (Option<Vec<u32>>, Option<Vec<u32>>)
+where
+    O: object::Object<'data>,
+    R: ReadRef<'data>,
 {
-    fn compute_function_addresses<'file, O>(
-        &'file self,
-        object_file: &'file O,
-    ) -> (Option<Vec<u32>>, Option<Vec<u32>>)
-    where
-        'data: 'file,
-        O: object::Object<'data, 'file>,
+    // Get function start addresses from LC_FUNCTION_STARTS
+    let mut function_starts = macho_data.get_function_starts().ok().flatten();
+
+    // and from __unwind_info.
+    if let Some(unwind_info) = object_file
+        .section_by_name_bytes(b"__unwind_info")
+        .and_then(|s| s.data().ok())
+        .and_then(|d| UnwindInfo::parse(d).ok())
     {
-        // Get function start addresses from LC_FUNCTION_STARTS
-        let mut function_starts = self.macho_data.get_function_starts().ok().flatten();
-
-        // and from __unwind_info.
-        if let Some(unwind_info) = object_file
-            .section_by_name_bytes(b"__unwind_info")
-            .and_then(|s| s.data().ok())
-            .and_then(|d| UnwindInfo::parse(d).ok())
-        {
-            let function_starts = function_starts.get_or_insert_with(Vec::new);
-            let mut iter = unwind_info.functions();
-            while let Ok(Some(function)) = iter.next() {
-                function_starts.push(function.start_address);
-            }
+        let function_starts = function_starts.get_or_insert_with(Vec::new);
+        let mut iter = unwind_info.functions();
+        while let Ok(Some(function)) = iter.next() {
+            function_starts.push(function.start_address);
         }
-
-        (function_starts, None)
     }
+
+    (function_starts, None)
 }
 
+#[derive(Clone, Copy)]
 pub struct MachOData<'data, R: ReadRef<'data>> {
     data: R,
     header_offset: u64,

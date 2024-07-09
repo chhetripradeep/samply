@@ -1,11 +1,13 @@
+use std::path::PathBuf;
+
 use debugid::DebugId;
 use linux_perf_data::jitdump::JitDumpError;
 use object::FileKind;
 use pdb_addr2line::pdb::Error as PdbError;
-use std::path::PathBuf;
 use thiserror::Error;
 
-use crate::{breakpad::BreakpadParseError, CodeId, FatArchiveMember, LibraryInfo};
+use crate::breakpad::BreakpadParseError;
+use crate::{CodeId, FatArchiveMember, LibraryInfo};
 
 /// The error type used in this crate.
 #[derive(Error, Debug)]
@@ -40,6 +42,9 @@ pub enum Error {
 
     #[error("External file has an unexpected FileKind: {0:?}")]
     UnexpectedExternalFileFileKind(FileKind),
+
+    #[error("Error parsing external archive file: {0}")]
+    ParseErrorInExternalArchive(#[source] object::read::Error),
 
     #[error("Not enough information was supplied to identify the requested symbol map. The debug ID is required.")]
     NotEnoughInformationToIdentifySymbolMap,
@@ -125,6 +130,9 @@ pub enum Error {
 
     #[error("No candidate path for binary, for {0:?}")]
     NoCandidatePathForDebugFile(Box<LibraryInfo>),
+
+    #[error("All candidate paths encountered failures:\n{}", .0.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("\n"))]
+    NoSuccessfulCandidate(Vec<Error>),
 
     #[error("No associated PDB file with the right debug ID was found for the PE (Windows) binary at path {0}")]
     NoMatchingPdbForBinary(String),
@@ -238,6 +246,7 @@ impl Error {
             Error::InvalidBreakpadId(_) => "InvalidBreakpadId",
             Error::EmptyFatArchive => "EmptyFatArchive",
             Error::CouldNotDetermineExternalFileFileKind => "CouldNotDetermineExternalFileFileKind",
+            Error::ParseErrorInExternalArchive(_) => "ParseErrorInExternalArchive",
             Error::FileLocationRefusedSubcacheLocation => "FileLocationRefusedSubcacheLocation",
             Error::FileLocationRefusedExternalObjectLocation => {
                 "FileLocationRefusedExternalObjectLocation"
@@ -269,6 +278,7 @@ impl Error {
             Error::NoCandidatePathForDebugFile(_) => "NoCandidatePathForDebugFile",
             Error::NoCandidatePathForBinary(_, _) => "NoCandidatePathForBinary",
             Error::NoCandidatePathForDyldCache => "NoCandidatePathForDyldCache",
+            Error::NoSuccessfulCandidate(_) => "NoSuccessfulCandidate",
             Error::NoDebugInfoInPeBinary(_) => "NoDebugInfoInPeBinary",
             Error::NoMatchingPdbForBinary(_) => "NoMatchingPdbForBinary",
             Error::PdbPathNotUtf8(_) => "PdbPathNotUtf8",

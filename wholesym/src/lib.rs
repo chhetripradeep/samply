@@ -6,7 +6,7 @@
 //!
 //!  1. Create a [`SymbolManager`] using [`SymbolManager::with_config`].
 //!  2. Load a [`SymbolMap`] with [`SymbolManager::load_symbol_map_for_binary_at_path`].
-//!  3. Look up an address with [`SymbolMap::lookup_relative_address`].
+//!  3. Look up an address with [`SymbolMap::lookup`].
 //!  4. Inspect the returned [`AddressInfo`], which gives you the symbol name, and
 //!     potentially file and line information, along with inlined function info.
 //!
@@ -17,7 +17,7 @@
 //! # Example
 //!
 //! ```
-//! use wholesym::{SymbolManager, SymbolManagerConfig, FramesLookupResult};
+//! use wholesym::{SymbolManager, SymbolManagerConfig, LookupAddress};
 //! use std::path::Path;
 //!
 //! # async fn run() -> Result<(), wholesym::Error> {
@@ -26,21 +26,12 @@
 //!     .load_symbol_map_for_binary_at_path(Path::new("/usr/bin/ls"), None)
 //!     .await?;
 //! println!("Looking up 0xd6f4 in /usr/bin/ls. Results:");
-//! if let Some(address_info) = symbol_map.lookup_relative_address(0xd6f4) {
+//! if let Some(address_info) = symbol_map.lookup(LookupAddress::Relative(0xd6f4)).await {
 //!     println!(
 //!         "Symbol: {:#x} {}",
 //!         address_info.symbol.address, address_info.symbol.name
 //!     );
-//!     let frames = match address_info.frames {
-//!         FramesLookupResult::Available(frames) => Some(frames),
-//!         FramesLookupResult::External(ext_ref) => {
-//!             symbol_manager
-//!                 .lookup_external(&symbol_map.symbol_file_origin(), &ext_ref)
-//!                 .await
-//!         }
-//!         FramesLookupResult::Unavailable => None,
-//!     };
-//!     if let Some(frames) = frames {
+//!     if let Some(frames) = address_info.frames {
 //!         for (i, frame) in frames.into_iter().enumerate() {
 //!             let function = frame.function.unwrap();
 //!             let file = frame.file_path.unwrap().display_path();
@@ -115,10 +106,8 @@
 //!  - [x] Breakpad symbol files, local or on a server
 //!  - [x] Symbols from the regular symbol table
 //!  - [x] Fallback symbols from exported functions and function start addresses
-//!
-//! Unsupported for now (patches accepted):
-//!
-//!  - [ ] Split DWARF (.dwo and .dwp files)
+//!  - [x] Split DWARF with .dwo files
+//!  - [x] Split DWARF with .dwp files
 //!
 //! # Performance
 //!
@@ -147,12 +136,14 @@ mod moria_mac;
 #[cfg(target_os = "macos")]
 mod moria_mac_spotlight;
 mod symbol_manager;
+mod vdso;
 
 pub use config::SymbolManagerConfig;
 pub use samply_symbols;
 pub use samply_symbols::{
     AddressInfo, CodeId, ElfBuildId, Error, ExternalFileAddressInFileRef, ExternalFileAddressRef,
     ExternalFileRef, ExternalFileSymbolMap, FrameDebugInfo, FramesLookupResult, LibraryInfo,
-    MappedPath, MultiArchDisambiguator, PeCodeId, SourceFilePath, SymbolInfo,
+    LookupAddress, MappedPath, MultiArchDisambiguator, PeCodeId, SourceFilePath, SymbolInfo,
+    SyncAddressInfo,
 };
 pub use symbol_manager::{SymbolFileOrigin, SymbolManager, SymbolMap};

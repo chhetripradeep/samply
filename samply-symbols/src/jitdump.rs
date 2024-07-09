@@ -1,23 +1,25 @@
+use std::borrow::Cow;
+use std::collections::hash_map::Entry;
+use std::collections::HashMap;
+use std::sync::Mutex;
+
 use debugid::DebugId;
 use linux_perf_data::jitdump::{
     JitCodeDebugInfoRecord, JitCodeLoadRecord, JitDumpReader, JitDumpRecord, JitDumpRecordHeader,
     JitDumpRecordType,
 };
-use linux_perf_data::{linux_perf_event_reader::RawData, Endianness};
+use linux_perf_data::linux_perf_event_reader::RawData;
+use linux_perf_data::Endianness;
 use yoke::Yoke;
+use yoke_derive::Yokeable;
 
-use std::{
-    borrow::Cow,
-    collections::{hash_map::Entry, HashMap},
-    sync::Mutex,
+use crate::error::Error;
+use crate::shared::{
+    FileContents, FileContentsCursor, FileContentsWrapper, FrameDebugInfo, FramesLookupResult,
+    LookupAddress, SourceFilePath, SymbolInfo,
 };
-
-use crate::shared::FileContentsCursor;
-use crate::{
-    symbol_map::{SymbolMapInnerWrapper, SymbolMapTrait},
-    AddressInfo, Error, FileContents, FileContentsWrapper, FileLocation, FrameDebugInfo,
-    FramesLookupResult, SourceFilePath, SymbolInfo, SymbolMap,
-};
+use crate::symbol_map::{GetInnerSymbolMap, SymbolMap, SymbolMapTrait};
+use crate::{FileAndPathHelper, SyncAddressInfo};
 
 pub fn is_jitdump_file<T: FileContents>(file_contents: &FileContentsWrapper<T>) -> bool {
     const MAGIC_BYTES_BE: &[u8] = b"JiTD";
@@ -161,48 +163,24 @@ pub struct JitDumpIndexEntry {
     pub code_bytes_len: u64,
 }
 
-pub fn get_symbol_map_for_jitdump<F, FL>(
-    file_contents: FileContentsWrapper<F>,
-    file_location: FL,
-) -> Result<SymbolMap<FL>, Error>
-where
-    F: FileContents + 'static,
-    FL: FileLocation,
-{
+pub fn get_symbol_map_for_jitdump<H: FileAndPathHelper>(
+    file_contents: FileContentsWrapper<H::F>,
+    file_location: H::FL,
+) -> Result<SymbolMap<H>, Error> {
     let outer = JitDumpSymbolMapOuter::new(file_contents)?;
     let symbol_map = JitDumpSymbolMap(Yoke::attach_to_cart(Box::new(outer), |outer| {
         outer.make_symbol_map()
     }));
-    Ok(SymbolMap::new(file_location, Box::new(symbol_map)))
+    Ok(SymbolMap::new_plain(file_location, Box::new(symbol_map)))
 }
 
 pub struct JitDumpSymbolMap<T: FileContents>(
-    Yoke<SymbolMapInnerWrapper<'static>, Box<JitDumpSymbolMapOuter<T>>>,
+    Yoke<JitDumpSymbolMapInnerWrapper<'static>, Box<JitDumpSymbolMapOuter<T>>>,
 );
 
-impl<T: FileContents> SymbolMapTrait for JitDumpSymbolMap<T> {
-    fn debug_id(&self) -> debugid::DebugId {
-        self.0.get().0.debug_id()
-    }
-
-    fn symbol_count(&self) -> usize {
-        self.0.get().0.symbol_count()
-    }
-
-    fn iter_symbols(&self) -> Box<dyn Iterator<Item = (u32, Cow<'_, str>)> + '_> {
-        self.0.get().0.iter_symbols()
-    }
-
-    fn lookup_relative_address(&self, address: u32) -> Option<AddressInfo> {
-        self.0.get().0.lookup_relative_address(address)
-    }
-
-    fn lookup_svma(&self, svma: u64) -> Option<AddressInfo> {
-        self.0.get().0.lookup_svma(svma)
-    }
-
-    fn lookup_offset(&self, offset: u64) -> Option<AddressInfo> {
-        self.0.get().0.lookup_offset(offset)
+impl<T: FileContents> GetInnerSymbolMap for JitDumpSymbolMap<T> {
+    fn get_inner_symbol_map<'a>(&'a self) -> &'a (dyn SymbolMapTrait + 'a) {
+        self.0.get().0.as_ref()
     }
 }
 
@@ -219,12 +197,12 @@ impl<T: FileContents> JitDumpSymbolMapOuter<T> {
         Ok(Self { data, index })
     }
 
-    pub fn make_symbol_map(&self) -> SymbolMapInnerWrapper<'_> {
+    pub fn make_symbol_map(&self) -> JitDumpSymbolMapInnerWrapper<'_> {
         let inner = JitDumpSymbolMapInner {
             index: &self.index,
             cache: Mutex::new(JitDumpSymbolMapCache::new(&self.data, &self.index)),
         };
-        SymbolMapInnerWrapper(Box::new(inner))
+        JitDumpSymbolMapInnerWrapper(Box::new(inner))
     }
 }
 
@@ -232,6 +210,9 @@ struct JitDumpSymbolMapInner<'a, T: FileContents> {
     index: &'a JitDumpIndex,
     cache: Mutex<JitDumpSymbolMapCache<'a, T>>,
 }
+
+#[derive(Yokeable)]
+pub struct JitDumpSymbolMapInnerWrapper<'data>(pub Box<dyn SymbolMapTrait + Send + Sync + 'data>);
 
 #[derive(Debug)]
 struct JitDumpSymbolMapCache<'a, T: FileContents> {
@@ -292,31 +273,23 @@ impl<'a, T: FileContents> JitDumpSymbolMapInner<'a, T> {
         index: usize,
         symbol_address: u32,
         offset_relative_to_symbol: u64,
-    ) -> Option<AddressInfo> {
+    ) -> Option<SyncAddressInfo> {
         let mut cache = self.cache.lock().unwrap();
         let name_bytes = cache.get_function_name(index)?;
         let name = String::from_utf8_lossy(name_bytes).into_owned();
         let debug_info = cache.get_debug_info(index);
-        let frames = match debug_info {
-            Some(debug_info) => {
-                let lookup_avma = debug_info.code_addr + offset_relative_to_symbol;
-                match debug_info.lookup(lookup_avma) {
-                    Some(entry) => {
-                        let file_path =
-                            String::from_utf8_lossy(&entry.file_path.as_slice()).into_owned();
-                        let frame = FrameDebugInfo {
-                            function: Some(name.clone()),
-                            file_path: Some(SourceFilePath::new(file_path, None)),
-                            line_number: Some(entry.line),
-                        };
-                        FramesLookupResult::Available(vec![frame])
-                    }
-                    None => FramesLookupResult::Unavailable,
-                }
-            }
-            None => FramesLookupResult::Unavailable,
-        };
-        Some(AddressInfo {
+        let frames = debug_info.and_then(|debug_info| {
+            let lookup_avma = debug_info.code_addr + offset_relative_to_symbol;
+            let entry = debug_info.lookup(lookup_avma)?;
+            let file_path = String::from_utf8_lossy(&entry.file_path.as_slice()).into_owned();
+            let frame = FrameDebugInfo {
+                function: Some(name.clone()),
+                file_path: Some(SourceFilePath::new(file_path, None)),
+                line_number: Some(entry.line),
+            };
+            Some(FramesLookupResult::Available(vec![frame]))
+        });
+        Some(SyncAddressInfo {
             symbol: SymbolInfo {
                 address: symbol_address,
                 size: Some(self.index.entries[index].code_bytes_len as u32),
@@ -346,19 +319,15 @@ impl<'a, T: FileContents> SymbolMapTrait for JitDumpSymbolMapInner<'a, T> {
         Box::new(iter)
     }
 
-    fn lookup_relative_address(&self, address: u32) -> Option<AddressInfo> {
-        let (index, symbol_address, offset_from_symbol) =
-            self.index.lookup_relative_address(address)?;
-        self.lookup_by_entry_index(index, symbol_address, offset_from_symbol)
-    }
-
-    fn lookup_svma(&self, _svma: u64) -> Option<AddressInfo> {
-        // SVMAs are not meaningful for JitDump files.
-        None
-    }
-
-    fn lookup_offset(&self, offset: u64) -> Option<AddressInfo> {
-        let (index, symbol_address, offset_from_symbol) = self.index.lookup_offset(offset)?;
+    fn lookup_sync(&self, address: LookupAddress) -> Option<SyncAddressInfo> {
+        let (index, symbol_address, offset_from_symbol) = match address {
+            LookupAddress::Relative(address) => self.index.lookup_relative_address(address)?,
+            LookupAddress::Svma(_) => {
+                // SVMAs are not meaningful for JitDump files.
+                return None;
+            }
+            LookupAddress::FileOffset(offset) => self.index.lookup_offset(offset)?,
+        };
         self.lookup_by_entry_index(index, symbol_address, offset_from_symbol)
     }
 }

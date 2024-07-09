@@ -1,10 +1,10 @@
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
 use fxprof_processed_profile::{
     LibraryHandle, MarkerTiming, Profile, Symbol, SymbolTable, ThreadHandle,
 };
 use linux_perf_data::jitdump::{JitDumpReader, JitDumpRecord, JitDumpRecordType};
-
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use super::jit_category_manager::JitCategoryManager;
 use super::jit_function_add_marker::JitFunctionAddMarker;
@@ -17,22 +17,28 @@ use super::utils::open_file_with_fallback;
 
 #[derive(Debug)]
 pub struct JitDumpManager {
-    pending_jitdump_paths: Vec<(PathBuf, Option<PathBuf>)>,
+    pending_jitdump_paths: Vec<(ThreadHandle, PathBuf, Option<PathBuf>)>,
     processors: Vec<SingleJitDumpProcessor>,
-    main_thread_handle: ThreadHandle,
+    unlink_after_open: bool,
 }
 
 impl JitDumpManager {
-    pub fn new_for_process(main_thread_handle: ThreadHandle) -> Self {
+    pub fn new(unlink_after_open: bool) -> Self {
         JitDumpManager {
             pending_jitdump_paths: Vec::new(),
             processors: Vec::new(),
-            main_thread_handle,
+            unlink_after_open,
         }
     }
 
-    pub fn add_jitdump_path(&mut self, path: impl Into<PathBuf>, fallback_dir: Option<PathBuf>) {
-        self.pending_jitdump_paths.push((path.into(), fallback_dir));
+    pub fn add_jitdump_path(
+        &mut self,
+        thread: ThreadHandle,
+        path: impl Into<PathBuf>,
+        fallback_dir: Option<PathBuf>,
+    ) {
+        self.pending_jitdump_paths
+            .push((thread, path.into(), fallback_dir));
     }
 
     pub fn process_pending_records(
@@ -43,17 +49,21 @@ impl JitDumpManager {
         timestamp_converter: &TimestampConverter,
     ) {
         self.pending_jitdump_paths
-            .retain_mut(|(path, fallback_dir)| {
+            .retain_mut(|(thread, path, fallback_dir)| {
                 fn jitdump_reader_for_path(
                     path: &Path,
                     fallback_dir: Option<&Path>,
+                    unlink_after_open: bool,
                 ) -> Option<(JitDumpReader<std::fs::File>, PathBuf)> {
                     let (file, path) = open_file_with_fallback(path, fallback_dir).ok()?;
                     let reader = JitDumpReader::new(file).ok()?;
+                    if unlink_after_open {
+                        std::fs::remove_file(&path).ok()?;
+                    }
                     Some((reader, path))
                 }
                 let Some((reader, actual_path)) =
-                    jitdump_reader_for_path(path, fallback_dir.as_deref())
+                    jitdump_reader_for_path(path, fallback_dir.as_deref(), self.unlink_after_open)
                 else {
                     return true;
                 };
@@ -62,11 +72,8 @@ impl JitDumpManager {
                     reader.header(),
                     profile,
                 );
-                self.processors.push(SingleJitDumpProcessor::new(
-                    reader,
-                    lib_handle,
-                    self.main_thread_handle,
-                ));
+                self.processors
+                    .push(SingleJitDumpProcessor::new(reader, lib_handle, *thread));
                 false // "Do not retain", i.e. remove from pending_jitdump_paths
             });
 
@@ -102,7 +109,7 @@ struct SingleJitDumpProcessor {
     lib_handle: LibraryHandle,
     lib_mapping_ops: LibMappingOpQueue,
     symbols: Vec<Symbol>,
-    main_thread_handle: ThreadHandle,
+    thread_handle: ThreadHandle,
 
     /// The relative_address of the next JIT function.
     ///
@@ -118,14 +125,14 @@ impl SingleJitDumpProcessor {
     pub fn new(
         reader: JitDumpReader<std::fs::File>,
         lib_handle: LibraryHandle,
-        main_thread_handle: ThreadHandle,
+        thread_handle: ThreadHandle,
     ) -> Self {
         Self {
             reader: Some(reader),
             lib_handle,
             lib_mapping_ops: Default::default(),
             symbols: Default::default(),
-            main_thread_handle,
+            thread_handle,
             cumulative_address: 0,
         }
     }
@@ -165,37 +172,35 @@ impl SingleJitDumpProcessor {
             match raw_jitdump_record.parse() {
                 Ok(JitDumpRecord::CodeLoad(record)) => {
                     let start_avma = record.code_addr;
-                    let end_avma = start_avma + record.code_bytes.len() as u64;
+                    let code_size = record.code_bytes.len() as u32;
+                    let end_avma = start_avma + u64::from(code_size);
 
                     let relative_address_at_start = self.cumulative_address;
-                    self.cumulative_address += record.code_bytes.len() as u32;
+                    self.cumulative_address += code_size;
 
                     let symbol_name = record.function_name.as_slice();
                     let symbol_name = std::str::from_utf8(&symbol_name).unwrap_or("");
                     self.symbols.push(Symbol {
                         address: relative_address_at_start,
-                        size: Some(record.code_bytes.len() as u32),
+                        size: Some(code_size),
                         name: symbol_name.to_owned(),
                     });
 
-                    let main_thread = self.main_thread_handle;
                     let timestamp = timestamp_converter.convert_time(raw_jitdump_record.timestamp);
-                    let timing = MarkerTiming::Instant(timestamp);
+                    let symbol_name_handle = profile.intern_string(symbol_name);
                     profile.add_marker(
-                        main_thread,
-                        "JitFunctionAdd",
-                        JitFunctionAddMarker(symbol_name.to_owned()),
-                        timing,
+                        self.thread_handle,
+                        MarkerTiming::Instant(timestamp),
+                        JitFunctionAddMarker(symbol_name_handle),
                     );
 
                     let (lib_handle, relative_address_at_start) =
                         if let Some(recycler) = recycler.as_deref_mut() {
                             recycler.recycle(
-                                start_avma,
-                                end_avma,
-                                relative_address_at_start,
                                 symbol_name,
+                                code_size,
                                 self.lib_handle,
+                                relative_address_at_start,
                             )
                         } else {
                             (self.lib_handle, relative_address_at_start)

@@ -1,21 +1,19 @@
-pub use samply_symbols::debugid;
-use samply_symbols::debugid::DebugId;
-use samply_symbols::{
-    self, CandidatePathInfo, CompactSymbolTable, Error, FileAndPathHelper, FileAndPathHelperResult,
-    FileLocation, LibraryInfo, MultiArchDisambiguator, OptionallySendFuture, SymbolManager,
-};
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
 
+pub use samply_symbols::debugid;
+use samply_symbols::debugid::DebugId;
+use samply_symbols::{
+    self, BinaryImage, CandidatePathInfo, CompactSymbolTable, Error, FileAndPathHelper,
+    FileAndPathHelperResult, FileLocation, LibraryInfo, MultiArchDisambiguator,
+    OptionallySendFuture, SymbolManager,
+};
 #[cfg(feature = "chunked_caching")]
 use samply_symbols::{FileByteSource, FileContents};
 
-use samply_symbols::BinaryImage;
-
-async fn get_library_info_with_dyld_cache_fallback<'h>(
-    symbol_manager: &SymbolManager<'h, Helper>,
+async fn get_library_info_with_dyld_cache_fallback(
+    symbol_manager: &SymbolManager<Helper>,
     path: &Path,
     debug_id: Option<DebugId>,
 ) -> Result<BinaryImage<FileContentsType>, Error> {
@@ -51,7 +49,7 @@ pub async fn get_table_for_binary(
     let helper = Helper {
         symbol_directory: binary_path.parent().unwrap().to_path_buf(),
     };
-    let symbol_manager = SymbolManager::with_helper(&helper);
+    let symbol_manager = SymbolManager::with_helper(helper);
     let binary =
         get_library_info_with_dyld_cache_fallback(&symbol_manager, binary_path, debug_id).await?;
     let info = binary.library_info();
@@ -66,7 +64,7 @@ pub async fn get_table_for_debug_name_and_id(
     symbol_directory: PathBuf,
 ) -> Result<CompactSymbolTable, Error> {
     let helper = Helper { symbol_directory };
-    let symbol_manager = SymbolManager::with_helper(&helper);
+    let symbol_manager = SymbolManager::with_helper(helper);
     let info = LibraryInfo {
         debug_name: Some(debug_name.to_string()),
         debug_id,
@@ -133,11 +131,9 @@ fn mmap_to_file_contents(m: memmap2::Mmap) -> FileContentsType {
     m
 }
 
-impl<'h> FileAndPathHelper<'h> for Helper {
+impl FileAndPathHelper for Helper {
     type F = FileContentsType;
     type FL = FileLocationType;
-    type OpenFileFuture =
-        Pin<Box<dyn OptionallySendFuture<Output = FileAndPathHelperResult<Self::F>> + 'h>>;
 
     fn get_candidate_paths_for_debug_file(
         &self,
@@ -207,34 +203,33 @@ impl<'h> FileAndPathHelper<'h> for Helper {
     }
 
     fn load_file(
-        &'h self,
+        &self,
         location: FileLocationType,
-    ) -> Pin<Box<dyn OptionallySendFuture<Output = FileAndPathHelperResult<Self::F>> + 'h>> {
-        async fn load_file_impl(path: PathBuf) -> FileAndPathHelperResult<memmap2::Mmap> {
+    ) -> std::pin::Pin<Box<dyn OptionallySendFuture<Output = FileAndPathHelperResult<Self::F>> + '_>>
+    {
+        Box::pin(async {
+            let mut path = location.0;
+
+            if !path.starts_with(&self.symbol_directory) {
+                // See if this file exists in self.symbol_directory.
+                // For example, when looking up object files referenced by mach-O binaries,
+                // we want to take the object files from the symbol directory if they exist,
+                // rather than from the original path.
+                if let Some(filename) = path.file_name() {
+                    let redirected_path = self.symbol_directory.join(filename);
+                    if std::fs::metadata(&redirected_path).is_ok() {
+                        // redirected_path exists!
+                        eprintln!("Redirecting {:?} to {:?}", &path, &redirected_path);
+                        path = redirected_path;
+                    }
+                }
+            }
+
             eprintln!("Reading file {:?}", &path);
             let file = File::open(&path)?;
             let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
             Ok(mmap_to_file_contents(mmap))
-        }
-
-        let mut path = location.0;
-
-        if !path.starts_with(&self.symbol_directory) {
-            // See if this file exists in self.symbol_directory.
-            // For example, when looking up object files referenced by mach-O binaries,
-            // we want to take the object files from the symbol directory if they exist,
-            // rather than from the original path.
-            if let Some(filename) = path.file_name() {
-                let redirected_path = self.symbol_directory.join(filename);
-                if std::fs::metadata(&redirected_path).is_ok() {
-                    // redirected_path exists!
-                    eprintln!("Redirecting {:?} to {:?}", &path, &redirected_path);
-                    path = redirected_path;
-                }
-            }
-        }
-
-        Box::pin(load_file_impl(path))
+        })
     }
 
     fn get_candidate_paths_for_binary(
@@ -310,5 +305,15 @@ impl FileLocation for FileLocationType {
 
     fn location_for_breakpad_symindex(&self) -> Option<Self> {
         Some(Self(self.0.with_extension("symindex")))
+    }
+
+    fn location_for_dwo(&self, _comp_dir: &str, _path: &str) -> Option<Self> {
+        None // TODO
+    }
+
+    fn location_for_dwp(&self) -> Option<Self> {
+        let mut s = self.0.as_os_str().to_os_string();
+        s.push(".dwp");
+        Some(Self(s.into()))
     }
 }

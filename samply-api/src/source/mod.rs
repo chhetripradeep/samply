@@ -1,8 +1,10 @@
-use crate::{api_file_path::to_api_file_path, to_debug_id};
 use samply_symbols::{
-    FileAndPathHelper, FileAndPathHelperError, FramesLookupResult, LibraryInfo, SymbolManager,
+    FileAndPathHelper, FileAndPathHelperError, LibraryInfo, LookupAddress, SymbolManager,
 };
 use serde_json::json;
+
+use crate::api_file_path::to_api_file_path;
+use crate::to_debug_id;
 
 mod request_json;
 mod response_json;
@@ -25,13 +27,13 @@ enum SourceError {
     FileAndPathHelperError(#[from] FileAndPathHelperError),
 }
 
-pub struct SourceApi<'a, 'h: 'a, H: FileAndPathHelper<'h>> {
-    symbol_manager: &'a SymbolManager<'h, H>,
+pub struct SourceApi<'a, H: FileAndPathHelper> {
+    symbol_manager: &'a SymbolManager<H>,
 }
 
-impl<'a, 'h: 'a, H: FileAndPathHelper<'h>> SourceApi<'a, 'h, H> {
+impl<'a, H: FileAndPathHelper> SourceApi<'a, H> {
     /// Create a [`SourceApi`] instance which uses the provided [`SymbolManager`].
-    pub fn new(symbol_manager: &'a SymbolManager<'h, H>) -> Self {
+    pub fn new(symbol_manager: &'a SymbolManager<H>) -> Self {
         Self { symbol_manager }
     }
 
@@ -61,35 +63,19 @@ impl<'a, 'h: 'a, H: FileAndPathHelper<'h>> SourceApi<'a, 'h, H> {
         let debug_id = to_debug_id(debug_id)?;
 
         // Look up the address to see which file paths we are allowed to read.
-        let (debug_file_location, frames) = {
-            let info = LibraryInfo {
-                debug_name: Some(debug_name.to_string()),
-                debug_id: Some(debug_id),
-                ..Default::default()
-            };
-            let symbol_map = self.symbol_manager.load_symbol_map(&info).await?;
-            let debug_file_location = symbol_map.debug_file_location().clone();
-            let frames = match symbol_map.lookup_relative_address(*module_offset) {
-                Some(address_info) => address_info.frames,
-                None => FramesLookupResult::Unavailable,
-            };
-            (debug_file_location, frames)
+        let info = LibraryInfo {
+            debug_name: Some(debug_name.to_string()),
+            debug_id: Some(debug_id),
+            ..Default::default()
         };
-
-        let frames = match frames {
-            FramesLookupResult::Available(frames) => frames,
-            FramesLookupResult::External(address) => {
-                match self
-                    .symbol_manager
-                    .lookup_external(&debug_file_location, &address)
-                    .await
-                {
-                    Some(frames) => frames,
-                    None => return Err(SourceError::NoDebugInfo),
-                }
-            }
-            FramesLookupResult::Unavailable => return Err(SourceError::NoDebugInfo),
-        };
+        let symbol_map = self.symbol_manager.load_symbol_map(&info).await?;
+        let debug_file_location = symbol_map.debug_file_location().clone();
+        let address_info = symbol_map
+            .lookup(LookupAddress::Relative(*module_offset))
+            .await;
+        let frames = address_info
+            .and_then(|ai| ai.frames)
+            .ok_or(SourceError::NoDebugInfo)?;
 
         // Find the SourceFilePath whose "api file path" matches the requested file.
         // This is where we check that the requested file path is permissible.

@@ -1,38 +1,208 @@
-use std::{collections::HashMap, sync::Mutex};
+use std::collections::HashMap;
+use std::sync::Mutex;
 
-use object::{read::archive::ArchiveFile, File, FileKind, ReadRef};
-use yoke::{Yoke, Yokeable};
+use object::read::archive::ArchiveFile;
+use object::{File, FileKind, ReadRef};
+use yoke::Yoke;
+use yoke_derive::Yokeable;
 
-use crate::{
-    dwarf::{get_frames, Addr2lineContextData},
-    macho,
-    path_mapper::PathMapper,
-    shared::{ExternalFileAddressInFileRef, ExternalFileRef, FileContentsWrapper, RangeReadRef},
-    Error, FileAndPathHelper, FileContents, FileLocation, FrameDebugInfo, MultiArchDisambiguator,
+use crate::dwarf::{get_frames, Addr2lineContextData};
+use crate::error::Error;
+use crate::path_mapper::PathMapper;
+use crate::shared::{
+    ExternalFileAddressInFileRef, FileAndPathHelper, FileContents, FileContentsWrapper,
+    FrameDebugInfo,
 };
 
-pub async fn load_external_file<'h, H>(
-    helper: &'h H,
-    original_file_location: &H::FL,
-    external_file_ref: &ExternalFileRef,
-) -> Result<ExternalFileSymbolMap, Error>
+pub async fn load_external_file<H>(
+    helper: &H,
+    external_file_location: H::FL,
+    external_file_path: &str,
+) -> Result<ExternalFileSymbolMap<H::F>, Error>
 where
-    H: FileAndPathHelper<'h>,
+    H: FileAndPathHelper,
 {
     let file = helper
-        .load_file(
-            original_file_location
-                .location_for_external_object_file(&external_file_ref.file_name)
-                .ok_or(Error::FileLocationRefusedExternalObjectLocation)?,
-        )
+        .load_file(external_file_location)
         .await
-        .map_err(|e| Error::HelperErrorDuringOpenFile(external_file_ref.file_name.clone(), e))?;
-    let symbol_map = ExternalFileSymbolMapImpl::new(
-        &external_file_ref.file_name,
-        file,
-        external_file_ref.arch.as_deref(),
-    )?;
-    Ok(ExternalFileSymbolMap(Box::new(symbol_map)))
+        .map_err(|e| Error::HelperErrorDuringOpenFile(external_file_path.to_string(), e))?;
+    let symbol_map = ExternalFileSymbolMap::new(external_file_path, file)?;
+    Ok(symbol_map)
+}
+
+struct ExternalFileOuter<F: FileContents> {
+    file_path: String,
+    file_contents: FileContentsWrapper<F>,
+    addr2line_context_data: Addr2lineContextData,
+}
+
+impl<F: FileContents> ExternalFileOuter<F> {
+    pub fn new(file_path: &str, file: F) -> Self {
+        let file_contents = FileContentsWrapper::new(file);
+        Self {
+            file_path: file_path.to_owned(),
+            file_contents,
+            addr2line_context_data: Addr2lineContextData::new(),
+        }
+    }
+
+    pub fn file_path(&self) -> &str {
+        &self.file_path
+    }
+
+    fn make_member_context(
+        &self,
+        offset_and_size: (u64, u64),
+    ) -> Result<ExternalFileMemberContext<'_>, Error> {
+        let (start, size) = offset_and_size;
+        let data = self.file_contents.range(start, size);
+        let object_file = File::parse(data).map_err(Error::MachOHeaderParseError)?;
+        self.make_single_context(data, object_file)
+    }
+
+    fn make_single_context<'s, R: ReadRef<'s>>(
+        &'s self,
+        data: R,
+        object_file: object::read::File<'s, R>,
+    ) -> Result<ExternalFileMemberContext<'s>, Error> {
+        use object::{Object, ObjectSymbol};
+        let context = self
+            .addr2line_context_data
+            .make_context(data, &object_file, None, None);
+        let symbol_addresses = object_file
+            .symbols()
+            .filter_map(|symbol| {
+                let file_path = symbol.name_bytes().ok()?;
+                let address = symbol.address();
+                Some((file_path, address))
+            })
+            .collect();
+        let member_context = ExternalFileMemberContext {
+            context: context.ok(),
+            symbol_addresses,
+        };
+        Ok(member_context)
+    }
+
+    pub fn make_inner(&self) -> Result<ExternalFileInner<'_, F>, Error> {
+        let file_kind = FileKind::parse(&self.file_contents)
+            .map_err(|_| Error::CouldNotDetermineExternalFileFileKind)?;
+        let member_contexts = match file_kind {
+            FileKind::MachO32 | FileKind::MachO64 => {
+                let data = self.file_contents.full_range();
+                let object_file = File::parse(data).map_err(Error::MachOHeaderParseError)?;
+                let context = self.make_single_context(data, object_file)?;
+                ExternalFileMemberContexts::SingleObject(context)
+            }
+            FileKind::Archive => {
+                let archive = ArchiveFile::parse(&self.file_contents)
+                    .map_err(Error::ParseErrorInExternalArchive)?;
+                let mut member_ranges = HashMap::new();
+                for member in archive.members() {
+                    let member = member.map_err(Error::ParseErrorInExternalArchive)?;
+                    let file_path = member.name().to_owned();
+                    member_ranges.insert(file_path, member.file_range());
+                }
+                ExternalFileMemberContexts::Archive {
+                    member_ranges,
+                    contexts: Mutex::new(HashMap::new()),
+                }
+            }
+            FileKind::MachOFat32 | FileKind::MachOFat64 => {
+                return Err(Error::UnexpectedExternalFileFileKind(file_kind));
+            }
+            _ => {
+                return Err(Error::UnexpectedExternalFileFileKind(file_kind));
+            }
+        };
+        Ok(ExternalFileInner {
+            external_file: self,
+            member_contexts,
+            path_mapper: Mutex::new(PathMapper::new()),
+        })
+    }
+}
+
+enum ExternalFileMemberContexts<'a> {
+    SingleObject(ExternalFileMemberContext<'a>),
+    /// member file_path -> context
+    Archive {
+        member_ranges: HashMap<Vec<u8>, (u64, u64)>,
+        contexts: Mutex<HashMap<String, ExternalFileMemberContext<'a>>>,
+    },
+}
+
+#[derive(Yokeable)]
+struct ExternalFileInnerWrapper<'a>(Box<dyn ExternalFileInnerTrait + Send + 'a>);
+
+trait ExternalFileInnerTrait {
+    fn lookup(
+        &self,
+        external_file_address: &ExternalFileAddressInFileRef,
+    ) -> Option<Vec<FrameDebugInfo>>;
+}
+
+struct ExternalFileInner<'a, T: FileContents> {
+    external_file: &'a ExternalFileOuter<T>,
+    member_contexts: ExternalFileMemberContexts<'a>,
+    path_mapper: Mutex<PathMapper<()>>,
+}
+
+impl<'a, F: FileContents> ExternalFileInnerTrait for ExternalFileInner<'a, F> {
+    fn lookup(
+        &self,
+        external_file_address: &ExternalFileAddressInFileRef,
+    ) -> Option<Vec<FrameDebugInfo>> {
+        let mut path_mapper = self.path_mapper.lock().unwrap();
+        match (&self.member_contexts, external_file_address) {
+            (
+                ExternalFileMemberContexts::SingleObject(context),
+                ExternalFileAddressInFileRef::MachoOsoObject {
+                    symbol_name,
+                    offset_from_symbol,
+                },
+            ) => context.lookup(symbol_name, *offset_from_symbol, &mut path_mapper),
+            (
+                ExternalFileMemberContexts::Archive {
+                    member_ranges,
+                    contexts,
+                },
+                ExternalFileAddressInFileRef::MachoOsoArchive {
+                    name_in_archive,
+                    symbol_name,
+                    offset_from_symbol,
+                },
+            ) => {
+                let mut member_contexts = contexts.lock().unwrap();
+                match member_contexts.get(name_in_archive) {
+                    Some(member_context) => {
+                        member_context.lookup(symbol_name, *offset_from_symbol, &mut path_mapper)
+                    }
+                    None => {
+                        let range = *member_ranges.get(name_in_archive.as_bytes())?;
+                        // .ok_or_else(|| Error::FileNotInArchive(name_in_archive.to_owned()))?;
+                        let member_context = self.external_file.make_member_context(range).ok()?;
+                        let res = member_context.lookup(
+                            symbol_name,
+                            *offset_from_symbol,
+                            &mut path_mapper,
+                        );
+                        member_contexts.insert(name_in_archive.to_string(), member_context);
+                        res
+                    }
+                }
+            }
+            (
+                ExternalFileMemberContexts::SingleObject(_),
+                ExternalFileAddressInFileRef::MachoOsoArchive { .. },
+            )
+            | (
+                ExternalFileMemberContexts::Archive { .. },
+                ExternalFileAddressInFileRef::MachoOsoObject { .. },
+            )
+            | (_, ExternalFileAddressInFileRef::ElfDwo { .. }) => None,
+        }
+    }
 }
 
 struct ExternalFileMemberContext<'a> {
@@ -53,134 +223,27 @@ impl<'a> ExternalFileMemberContext<'a> {
     }
 }
 
-struct ExternalFileContext<'a, F: FileContents> {
-    external_file: &'a ExternalFileData<F>,
-    member_contexts: Mutex<HashMap<String, ExternalFileMemberContext<'a>>>,
-    path_mapper: Mutex<PathMapper<()>>,
-}
-
-trait ExternalFileDataOuterTrait {
-    #[cfg(feature = "send_futures")]
-    fn make_type_erased_file_context(&self)
-        -> Box<dyn ExternalFileContextTrait + '_ + Send + Sync>;
-    #[cfg(not(feature = "send_futures"))]
-    fn make_type_erased_file_context(&self) -> Box<dyn ExternalFileContextTrait + '_>;
-
-    fn make_member_context<'s>(
-        &'s self,
-        name_in_archive: Option<&str>,
-    ) -> Result<ExternalFileMemberContext<'s>, Error>;
-    fn name(&self) -> &str;
-}
-
-trait ExternalFileContextTrait {
-    fn lookup(
-        &self,
-        external_file_address: &ExternalFileAddressInFileRef,
-    ) -> Option<Vec<FrameDebugInfo>>;
-}
-
-impl<'a, F: FileContents> ExternalFileContextTrait for ExternalFileContext<'a, F> {
-    fn lookup(
-        &self,
-        external_file_address: &ExternalFileAddressInFileRef,
-    ) -> Option<Vec<FrameDebugInfo>> {
-        let member_key = external_file_address
-            .name_in_archive
-            .as_deref()
-            .unwrap_or("");
-        let mut member_contexts = self.member_contexts.lock().unwrap();
-        let mut path_mapper = self.path_mapper.lock().unwrap();
-        match member_contexts.get(member_key) {
-            Some(member_context) => member_context.lookup(
-                &external_file_address.symbol_name,
-                external_file_address.offset_from_symbol,
-                &mut path_mapper,
-            ),
-            None => {
-                let member_context = self
-                    .external_file
-                    .make_member_context(external_file_address.name_in_archive.as_deref())
-                    .ok()?;
-                let res = member_context.lookup(
-                    &external_file_address.symbol_name,
-                    external_file_address.offset_from_symbol,
-                    &mut path_mapper,
-                );
-                member_contexts.insert(member_key.to_string(), member_context);
-                res
-            }
-        }
-    }
-}
-
-struct ExternalFileSymbolMapImpl<F: FileContents + 'static>(
-    Yoke<ExternalFileContextWrapper<'static>, Box<ExternalFileData<F>>>,
+pub struct ExternalFileSymbolMap<F: FileContents + 'static>(
+    Yoke<ExternalFileInnerWrapper<'static>, Box<ExternalFileOuter<F>>>,
 );
 
-trait ExternalFileSymbolMapTrait {
-    fn name(&self) -> &str;
-    fn is_same_file(&self, external_file_ref: &ExternalFileRef) -> bool;
-    fn lookup(
-        &self,
-        external_file_address: &ExternalFileAddressInFileRef,
-    ) -> Option<Vec<FrameDebugInfo>>;
-}
-
-impl<F: FileContents + 'static> ExternalFileSymbolMapImpl<F> {
-    pub fn new(file_name: &str, file: F, arch: Option<&str>) -> Result<Self, Error> {
-        let external_file = Box::new(ExternalFileData::new(file_name, file, arch)?);
-        let inner =
-            Yoke::<ExternalFileContextWrapper<'static>, Box<ExternalFileData<F>>>::attach_to_cart(
-                external_file,
-                |external_file| {
-                    let uplooker = external_file.make_type_erased_file_context();
-                    ExternalFileContextWrapper(uplooker)
-                },
-            );
+impl<F: FileContents + 'static> ExternalFileSymbolMap<F> {
+    pub fn new(file_path: &str, file: F) -> Result<Self, Error> {
+        let outer = ExternalFileOuter::new(file_path, file);
+        let inner = Yoke::try_attach_to_cart(
+            Box::new(outer),
+            |outer| -> Result<ExternalFileInnerWrapper<'_>, Error> {
+                let inner = outer.make_inner()?;
+                Ok(ExternalFileInnerWrapper(Box::new(inner)))
+            },
+        )?;
         Ok(Self(inner))
     }
-}
 
-impl<F: FileContents + 'static> ExternalFileSymbolMapTrait for ExternalFileSymbolMapImpl<F> {
-    fn name(&self) -> &str {
-        self.0.backing_cart().name()
-    }
-
-    fn is_same_file(&self, external_file_ref: &ExternalFileRef) -> bool {
-        self.name() == external_file_ref.file_name
-    }
-
-    fn lookup(
-        &self,
-        external_file_address: &ExternalFileAddressInFileRef,
-    ) -> Option<Vec<FrameDebugInfo>> {
-        self.0.get().0.lookup(external_file_address)
-    }
-}
-
-/// A symbol map for an external object file. You usually don't need this because
-/// you usually call `SymbolManager::lookup_external`.
-#[cfg(feature = "send_futures")]
-pub struct ExternalFileSymbolMap(Box<dyn ExternalFileSymbolMapTrait + Send + Sync>);
-
-/// A symbol map for an external object file. You usually don't need this because
-/// you usually call `SymbolManager::lookup_external`.
-#[cfg(not(feature = "send_futures"))]
-pub struct ExternalFileSymbolMap(Box<dyn ExternalFileSymbolMapTrait>);
-
-impl ExternalFileSymbolMap {
     /// The string which identifies this external file. This is usually an absolute
-    /// path. (XXX does this contain the `archive.a(membername)` stuff or no?)
-    pub fn name(&self) -> &str {
-        self.0.name()
-    }
-
-    /// Checks whether `external_file_ref` refers to this external file.
-    ///
-    /// Used to avoid repeated loading of the same external file.
-    pub fn is_same_file(&self, external_file_ref: &ExternalFileRef) -> bool {
-        self.0.is_same_file(external_file_ref)
+    /// path.
+    pub fn file_path(&self) -> &str {
+        self.0.backing_cart().file_path()
     }
 
     /// Look up the debug info for the given [`ExternalFileAddressInFileRef`].
@@ -188,135 +251,6 @@ impl ExternalFileSymbolMap {
         &self,
         external_file_address: &ExternalFileAddressInFileRef,
     ) -> Option<Vec<FrameDebugInfo>> {
-        self.0.lookup(external_file_address)
-    }
-}
-
-#[cfg(feature = "send_futures")]
-#[derive(Yokeable)]
-struct ExternalFileContextWrapper<'a>(Box<dyn ExternalFileContextTrait + 'a + Send + Sync>);
-
-#[cfg(not(feature = "send_futures"))]
-#[derive(Yokeable)]
-struct ExternalFileContextWrapper<'a>(Box<dyn ExternalFileContextTrait + 'a>);
-
-impl<F: FileContents> ExternalFileDataOuterTrait for ExternalFileData<F> {
-    #[cfg(feature = "send_futures")]
-    fn make_type_erased_file_context(
-        &self,
-    ) -> Box<dyn ExternalFileContextTrait + '_ + Send + Sync> {
-        Box::new(self.make_file_context())
-    }
-    #[cfg(not(feature = "send_futures"))]
-    fn make_type_erased_file_context(&self) -> Box<dyn ExternalFileContextTrait + '_> {
-        Box::new(self.make_file_context())
-    }
-    fn make_member_context<'s>(
-        &'s self,
-        name_in_archive: Option<&str>,
-    ) -> Result<ExternalFileMemberContext<'s>, Error> {
-        use object::{Object, ObjectSymbol};
-        let ArchiveMemberObject { data, object_file } = self.get_archive_member(name_in_archive)?;
-        let context = self
-            .addr2line_context_data
-            .make_context(data, &object_file, None, None);
-        let symbol_addresses = object_file
-            .symbols()
-            .filter_map(|symbol| {
-                let name = symbol.name_bytes().ok()?;
-                let address = symbol.address();
-                Some((name, address))
-            })
-            .collect();
-        let uplooker = ExternalFileMemberContext {
-            context: context.ok(),
-            symbol_addresses,
-        };
-        Ok(uplooker)
-    }
-    fn name(&self) -> &str {
-        &self.name
-    }
-}
-
-struct ArchiveMemberObject<'a, R: ReadRef<'a>> {
-    data: R,
-    object_file: object::read::File<'a, R>,
-}
-
-struct ExternalFileData<F: FileContents> {
-    name: String,
-    file_contents: FileContentsWrapper<F>,
-    /// name in bytes -> (start, size) in file_contents
-    archive_members_by_name: HashMap<Vec<u8>, (u64, u64)>,
-    fat_archive_range: Option<(u64, u64)>,
-    addr2line_context_data: Addr2lineContextData,
-}
-
-impl<F: FileContents> ExternalFileData<F> {
-    pub fn new(file_name: &str, file: F, arch: Option<&str>) -> Result<Self, Error> {
-        let mut archive_members_by_name: HashMap<Vec<u8>, (u64, u64)> = HashMap::new();
-        let file_contents = FileContentsWrapper::new(file);
-        let mut fat_archive_range = None;
-        let file_kind = FileKind::parse(&file_contents)
-            .map_err(|_| Error::CouldNotDetermineExternalFileFileKind)?;
-        match file_kind {
-            FileKind::Archive => {
-                if let Ok(archive) = ArchiveFile::parse(&file_contents) {
-                    for member in archive.members().flatten() {
-                        archive_members_by_name
-                            .insert(member.name().to_owned(), member.file_range());
-                    }
-                }
-            }
-            FileKind::MachO32 | FileKind::MachO64 => {
-                // Good
-            }
-            FileKind::MachOFat32 | FileKind::MachOFat64 => {
-                let disambiguator = arch.map(|arch| MultiArchDisambiguator::Arch(arch.to_string()));
-                let member =
-                    macho::get_fat_archive_member(&file_contents, file_kind, disambiguator)?;
-                fat_archive_range = Some(member.offset_and_size);
-            }
-            _ => {
-                return Err(Error::UnexpectedExternalFileFileKind(file_kind));
-            }
-        }
-        Ok(Self {
-            name: file_name.to_owned(),
-            file_contents,
-            archive_members_by_name,
-            fat_archive_range,
-            addr2line_context_data: Addr2lineContextData::new(),
-        })
-    }
-
-    fn get_archive_member<'s>(
-        &'s self,
-        name_in_archive: Option<&str>,
-    ) -> Result<ArchiveMemberObject<'s, RangeReadRef<&'s FileContentsWrapper<F>>>, Error> {
-        let data = &self.file_contents;
-        let data = match (name_in_archive, self.fat_archive_range) {
-            (Some(name_in_archive), _) => {
-                let (start, size) = self
-                    .archive_members_by_name
-                    .get(name_in_archive.as_bytes())
-                    .ok_or_else(|| Error::FileNotInArchive(name_in_archive.to_owned()))?;
-                RangeReadRef::new(data, *start, *size)
-            }
-            (None, Some((offset, size))) => RangeReadRef::new(data, offset, size),
-            (None, None) => RangeReadRef::new(data, 0, data.len()),
-        };
-        let object_file = File::parse(data).map_err(Error::MachOHeaderParseError)?;
-        Ok(ArchiveMemberObject { data, object_file })
-    }
-
-    pub fn make_file_context(&self) -> ExternalFileContext<'_, F> {
-        let path_mapper = PathMapper::new();
-        ExternalFileContext {
-            external_file: self,
-            member_contexts: Mutex::new(HashMap::new()),
-            path_mapper: Mutex::new(path_mapper),
-        }
+        self.0.get().0.lookup(external_file_address)
     }
 }

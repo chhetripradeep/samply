@@ -63,10 +63,14 @@ pub use category_color::CategoryColor;
 pub use counters::CounterHandle;
 pub use cpu_delta::CpuDelta;
 pub use frame::{Frame, FrameFlags, FrameInfo};
-pub use global_lib_table::LibraryHandle;
+pub use global_lib_table::{LibraryHandle, UsedLibraryAddressesIterator};
 pub use lib_mappings::LibMappings;
 pub use library_info::{LibraryInfo, Symbol, SymbolTable};
-pub use markers::*;
+pub use markers::{
+    Marker, MarkerFieldFormat, MarkerFieldFormatKind, MarkerFieldSchema, MarkerHandle,
+    MarkerLocation, MarkerSchema, MarkerStaticField, MarkerTiming, MarkerTypeHandle,
+    StaticSchemaMarker,
+};
 pub use process::ThreadHandle;
 pub use profile::{Profile, SamplingInterval, StringHandle};
 pub use reference_timestamp::ReferenceTimestamp;

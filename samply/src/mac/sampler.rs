@@ -1,57 +1,55 @@
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
+use std::{mem, thread};
+
 use crossbeam_channel::Receiver;
 use fxprof_processed_profile::{CategoryColor, CategoryPairHandle, Profile, ReferenceTimestamp};
 use mach::port::mach_port_t;
 
-use std::mem;
-use std::path::{Path, PathBuf};
-use std::thread;
-use std::time::Duration;
-use std::time::SystemTime;
-
-use crate::shared::recording_props::{ConversionProps, RecordingProps};
+use super::error::SamplingError;
+use super::task_profiler::TaskProfiler;
+use super::time::get_monotonic_timestamp;
+use crate::shared::recording_props::{ProfileCreationProps, RecordingProps};
 use crate::shared::recycling::ProcessRecycler;
 use crate::shared::timestamp_converter::TimestampConverter;
 use crate::shared::unresolved_samples::UnresolvedStacks;
 
-use super::error::SamplingError;
-use super::task_profiler::TaskProfiler;
-use super::time::get_monotonic_timestamp;
+pub enum JitdumpOrMarkerPath {
+    JitdumpPath(PathBuf),
+    MarkerFilePath(PathBuf),
+}
+
+#[derive(Debug, Clone)]
+pub enum TaskInitOrShutdown {
+    TaskInit(TaskInit),
+    Shutdown,
+}
 
 #[derive(Debug, Clone)]
 pub struct TaskInit {
     pub start_time_mono: u64,
     pub task: mach_port_t,
     pub pid: u32,
-    pub jitdump_path_receiver: Receiver<PathBuf>,
+    pub path_receiver: Receiver<JitdumpOrMarkerPath>,
 }
 
 pub struct Sampler {
-    command_name: String,
-    task_receiver: Receiver<TaskInit>,
-    recording_props: RecordingProps,
-    conversion_props: ConversionProps,
+    task_receiver: Receiver<TaskInitOrShutdown>,
+    recording_props: Arc<RecordingProps>,
+    profile_creation_props: Arc<ProfileCreationProps>,
 }
 
 impl Sampler {
     pub fn new(
-        command: String,
-        task_receiver: Receiver<TaskInit>,
+        task_receiver: Receiver<TaskInitOrShutdown>,
         recording_props: RecordingProps,
-        conversion_props: ConversionProps,
+        profile_creation_props: ProfileCreationProps,
     ) -> Self {
-        let command_name = Path::new(&command)
-            .components()
-            .next_back()
-            .unwrap()
-            .as_os_str()
-            .to_string_lossy()
-            .to_string();
-
         Sampler {
-            command_name,
             task_receiver,
-            recording_props,
-            conversion_props,
+            recording_props: Arc::new(recording_props),
+            profile_creation_props: Arc::new(profile_creation_props),
         }
     }
 
@@ -65,10 +63,13 @@ impl Sampler {
         };
 
         let mut profile = Profile::new(
-            &self.conversion_props.profile_name,
+            self.profile_creation_props.profile_name(),
             ReferenceTimestamp::from_system_time(reference_system_time),
             self.recording_props.interval.into(),
         );
+        if let Some(macos_name_and_version) = get_macos_name_and_version() {
+            profile.set_os_name(&macos_name_and_version);
+        }
 
         let mut jit_category_manager =
             crate::shared::jit_category_manager::JitCategoryManager::new();
@@ -77,13 +78,17 @@ impl Sampler {
             CategoryPairHandle::from(profile.add_category("User", CategoryColor::Yellow));
 
         let root_task_init = match self.task_receiver.recv() {
-            Ok(task_init) => task_init,
+            Ok(TaskInitOrShutdown::TaskInit(task_init)) => task_init,
+            Ok(TaskInitOrShutdown::Shutdown) => {
+                eprintln!("Unexpected Shutdown message for root task?");
+                return Err(SamplingError::CouldNotObtainRootTask);
+            }
             Err(_) => {
                 // The sender went away. No profiling today.
                 return Err(SamplingError::CouldNotObtainRootTask);
             }
         };
-        let mut process_recycler = if self.conversion_props.merge_threads {
+        let mut process_recycler = if self.profile_creation_props.reuse_threads {
             Some(ProcessRecycler::new())
         } else {
             None
@@ -92,9 +97,10 @@ impl Sampler {
         let root_task = TaskProfiler::new(
             root_task_init,
             timestamp_converter,
-            &self.command_name,
+            &self.profile_creation_props.fallback_profile_name,
             &mut profile,
             process_recycler.as_mut(),
+            self.profile_creation_props.clone(),
         )
         .expect("couldn't create root TaskProfiler");
 
@@ -104,10 +110,11 @@ impl Sampler {
         let mut unwinder_cache = Default::default();
         let mut unresolved_stacks = UnresolvedStacks::default();
         let mut last_sleep_overshoot = 0;
+        let mut stop_profiling = false;
 
         loop {
             loop {
-                let task_init = if !live_tasks.is_empty() {
+                let task_init_or_shutdown = if !live_tasks.is_empty() {
                     // Poll to see if there are any new tasks we should add. If no new tasks are available,
                     // this completes immediately.
                     self.task_receiver.try_recv().ok()
@@ -117,19 +124,35 @@ impl Sampler {
                     let all_dead_timeout = Duration::from_secs_f32(0.5);
                     self.task_receiver.recv_timeout(all_dead_timeout).ok()
                 };
-                let Some(task_init) = task_init else { break };
+                let Some(task_or_shutdown) = task_init_or_shutdown else {
+                    break;
+                };
+                let task_init = match task_or_shutdown {
+                    TaskInitOrShutdown::TaskInit(task_init) => task_init,
+                    TaskInitOrShutdown::Shutdown => {
+                        // We got a shutdown message, so we should just stop profiling.
+                        stop_profiling = true;
+                        break;
+                    }
+                };
                 if let Ok(new_task) = TaskProfiler::new(
                     task_init,
                     timestamp_converter,
-                    &self.command_name,
+                    &self.profile_creation_props.fallback_profile_name,
                     &mut profile,
                     process_recycler.as_mut(),
+                    self.profile_creation_props.clone(),
                 ) {
                     live_tasks.push(new_task);
                 } else {
                     // The task is probably already dead again. We get here for tasks which are
                     // very short-lived.
                 }
+            }
+
+            if stop_profiling {
+                eprintln!("Stopping profile.");
+                break;
             }
 
             if live_tasks.is_empty() {
@@ -150,6 +173,7 @@ impl Sampler {
             let mut tasks = Vec::with_capacity(live_tasks.capacity());
             mem::swap(&mut live_tasks, &mut tasks);
             for mut task in tasks.into_iter() {
+                task.check_received_paths();
                 task.check_jitdump(&mut profile, &mut jit_category_manager);
                 let still_alive = task.sample(
                     sample_timestamp,
@@ -158,7 +182,6 @@ impl Sampler {
                     &mut profile,
                     &mut stack_scratch_buffer,
                     &mut unresolved_stacks,
-                    self.conversion_props.fold_recursive_prefix,
                 )?;
                 if still_alive {
                     live_tasks.push(task);
@@ -204,10 +227,24 @@ impl Sampler {
                 default_category,
                 &mut stack_frame_scratch_buf,
                 &unresolved_stacks,
-                &[],
             );
         }
 
         Ok(profile)
     }
+}
+
+fn get_macos_name_and_version() -> Option<String> {
+    #[derive(serde_derive::Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    struct SystemVersionDict {
+        product_name: String,
+        product_user_visible_version: String,
+    }
+
+    let SystemVersionDict {
+        product_name,
+        product_user_visible_version,
+    } = plist::from_file("/System/Library/CoreServices/SystemVersion.plist").ok()?;
+    Some(format!("{product_name} {product_user_visible_version}"))
 }

@@ -1,15 +1,15 @@
 use std::marker::PhantomData;
 
+use addr2line::{fallible_iterator, gimli};
+use elsa::sync::FrozenVec;
+use fallible_iterator::FallibleIterator;
+use gimli::{DwarfPackage, EndianSlice, Reader, RunTimeEndian, SectionId};
+use object::read::ReadRef;
+use object::CompressionFormat;
+
 use crate::path_mapper::PathMapper;
 use crate::shared::FrameDebugInfo;
 use crate::{demangle, Error, SourceFilePath};
-use addr2line::fallible_iterator;
-use addr2line::gimli;
-use elsa::sync::FrozenVec;
-use fallible_iterator::FallibleIterator;
-use gimli::{EndianSlice, Reader, RunTimeEndian, SectionId};
-use object::read::ReadRef;
-use object::{CompressedFileRange, CompressionFormat};
 
 pub fn get_frames<R: Reader>(
     address: u64,
@@ -17,6 +17,13 @@ pub fn get_frames<R: Reader>(
     path_mapper: &mut PathMapper<()>,
 ) -> Option<Vec<FrameDebugInfo>> {
     let frame_iter = context?.find_frames(address).skip_all_loads().ok()?;
+    convert_frames(frame_iter, path_mapper)
+}
+
+pub fn convert_frames<'a, R: gimli::Reader>(
+    frame_iter: impl FallibleIterator<Item = addr2line::Frame<'a, R>>,
+    path_mapper: &mut PathMapper<()>,
+) -> Option<Vec<FrameDebugInfo>> {
     let frames: Vec<_> = frame_iter
         .map(|f| Ok(convert_stack_frame(f, &mut *path_mapper)))
         .collect()
@@ -65,57 +72,24 @@ pub enum SingleSectionData<'data, T: ReadRef<'data>> {
     Owned(Vec<u8>),
 }
 
-pub fn try_get_section_data<'data, 'file, O, T>(
+pub fn try_get_section_data<'data, O, T>(
     data: T,
-    file: &'file O,
+    file: &O,
     section_id: SectionId,
+    is_for_dwo_dwp: bool,
 ) -> Option<SingleSectionData<'data, T>>
 where
-    'data: 'file,
-    O: object::Object<'data, 'file>,
+    O: object::Object<'data>,
     T: ReadRef<'data>,
 {
     use object::ObjectSection;
-    let section_name = section_id.name();
-    let (section, used_manual_zdebug_path) =
-        if let Some(section) = file.section_by_name(section_name) {
-            (section, false)
-        } else {
-            // Also detect old-style compressed section which start with .zdebug / __zdebug
-            // in case object did not detect them.
-            assert!(section_name.as_bytes().starts_with(b".debug_"));
-            let mut name = Vec::with_capacity(section_name.len() + 1);
-            name.extend_from_slice(b".zdebug_");
-            name.extend_from_slice(&section_name.as_bytes()[7..]);
-            let section = file.section_by_name_bytes(&name)?;
-            (section, true)
-        };
-
-    // Handle sections which are not compressed.
-    let mut file_range = section.compressed_file_range().ok()?;
-    if file_range.format == CompressionFormat::None
-        && used_manual_zdebug_path
-        && file_range.uncompressed_size > 12
-    {
-        let first_twelve = data.read_bytes_at(file_range.offset, 12).ok()?;
-        if first_twelve.starts_with(b"ZLIB\0\0\0\0") {
-            // Object's built-in compressed section handling didn't detect this as a
-            // compressed section. This happens on old Go binaries which use compressed
-            // sections like __zdebug_ranges, which is generally uncommon on macOS, so
-            // object's mach-O parser doesn't handle them.
-            // But we want to handle them.
-            // Go fixed this in https://github.com/golang/go/issues/50796 .
-            let b = first_twelve.get(8..12)?;
-            let uncompressed_size = u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
-            file_range = CompressedFileRange {
-                format: CompressionFormat::Zlib,
-                offset: file_range.offset + 12,
-                compressed_size: file_range.uncompressed_size - 12,
-                uncompressed_size: u64::from(uncompressed_size),
-            };
-        }
-    }
-
+    let section_name = if is_for_dwo_dwp {
+        section_id.dwo_name()?
+    } else {
+        section_id.name()
+    };
+    let section = file.section_by_name(section_name)?;
+    let file_range = section.compressed_file_range().ok()?;
     match file_range.format {
         CompressionFormat::None => Some(SingleSectionData::View {
             data,
@@ -160,21 +134,20 @@ impl Addr2lineContextData {
         }
     }
 
-    fn sect<'data, 'ctxdata, 'file, O, R>(
+    fn sect<'data, 'ctxdata, O, R>(
         &'ctxdata self,
         data: R,
-        obj: &'file O,
+        obj: &O,
         section_id: SectionId,
         endian: RunTimeEndian,
+        is_for_dwo_dwp: bool,
     ) -> EndianSlice<'ctxdata, RunTimeEndian>
     where
-        'data: 'file,
         'data: 'ctxdata,
-        'ctxdata: 'file,
-        O: object::Object<'data, 'file>,
+        O: object::Object<'data>,
         R: ReadRef<'data>,
     {
-        let slice: &[u8] = match try_get_section_data(data, obj, section_id) {
+        let slice: &[u8] = match try_get_section_data(data, obj, section_id, is_for_dwo_dwp) {
             Some(SingleSectionData::Owned(section_data)) => {
                 self.uncompressed_section_data.push_get(section_data)
             }
@@ -186,18 +159,16 @@ impl Addr2lineContextData {
         EndianSlice::new(slice, endian)
     }
 
-    pub fn make_context<'data, 'ctxdata, 'file, O, R>(
+    pub fn make_context<'data, 'ctxdata, O, R>(
         &'ctxdata self,
         data: R,
-        obj: &'file O,
+        obj: &O,
         sup_data: Option<R>,
-        sup_obj: Option<&'file O>,
+        sup_obj: Option<&O>,
     ) -> Result<addr2line::Context<EndianSlice<'ctxdata, RunTimeEndian>>, Error>
     where
-        'data: 'file,
         'data: 'ctxdata,
-        'ctxdata: 'file,
-        O: object::Object<'data, 'file>,
+        O: object::Object<'data>,
         R: ReadRef<'data>,
     {
         let e = if obj.is_little_endian() {
@@ -205,15 +176,70 @@ impl Addr2lineContextData {
         } else {
             gimli::RunTimeEndian::Big
         };
-        let mut dwarf = gimli::Dwarf::load(|s| Ok(self.sect(data, obj, s, e)))
+        let mut dwarf = gimli::Dwarf::load(|s| Ok(self.sect(data, obj, s, e, false)))
             .map_err(Error::Addr2lineContextCreationError)?;
         if let (Some(sup_obj), Some(sup_data)) = (sup_obj, sup_data) {
             dwarf
-                .load_sup(|s| Ok(self.sect(sup_data, sup_obj, s, e)))
+                .load_sup(|s| Ok(self.sect(sup_data, sup_obj, s, e, false)))
                 .map_err(Error::Addr2lineContextCreationError)?;
         }
         let context =
             addr2line::Context::from_dwarf(dwarf).map_err(Error::Addr2lineContextCreationError)?;
         Ok(context)
+    }
+
+    pub fn make_package<'data, 'ctxdata, O, R>(
+        &'ctxdata self,
+        data: R,
+        obj: &O,
+        dwp_data: Option<R>,
+        dwp_obj: Option<&O>,
+    ) -> Result<Option<DwarfPackage<EndianSlice<'ctxdata, RunTimeEndian>>>, Error>
+    where
+        'data: 'ctxdata,
+        O: object::Object<'data>,
+        R: ReadRef<'data>,
+    {
+        let e = if obj.is_little_endian() {
+            gimli::RunTimeEndian::Little
+        } else {
+            gimli::RunTimeEndian::Big
+        };
+        let mut package = None;
+        if let (Some(dwp_obj), Some(dwp_data)) = (dwp_obj, dwp_data) {
+            package = DwarfPackage::load::<_, gimli::Error>(
+                |s| Ok(self.sect(dwp_data, dwp_obj, s, e, true)),
+                EndianSlice::new(&[], e),
+            )
+            .ok();
+        }
+        if package.is_none() && obj.section_by_name(".debug_cu_index").is_some() {
+            package = DwarfPackage::load::<_, gimli::Error>(
+                |s| Ok(self.sect(data, obj, s, e, true)),
+                EndianSlice::new(&[], e),
+            )
+            .ok();
+        }
+        Ok(package)
+    }
+
+    pub fn make_dwarf_for_dwo<'data, 'ctxdata, O, R>(
+        &'ctxdata self,
+        data: R,
+        obj: &O,
+    ) -> Result<addr2line::gimli::Dwarf<EndianSlice<'ctxdata, RunTimeEndian>>, Error>
+    where
+        'data: 'ctxdata,
+        O: object::Object<'data>,
+        R: ReadRef<'data>,
+    {
+        let e = if obj.is_little_endian() {
+            gimli::RunTimeEndian::Little
+        } else {
+            gimli::RunTimeEndian::Big
+        };
+        let dwarf = gimli::Dwarf::load(|s| Ok(self.sect(data, obj, s, e, true)))
+            .map_err(Error::Addr2lineContextCreationError)?;
+        Ok(dwarf)
     }
 }

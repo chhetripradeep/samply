@@ -1,4 +1,5 @@
-use std::{collections::HashMap, path::PathBuf};
+use std::collections::HashMap;
+use std::path::PathBuf;
 
 use symsrv::{parse_nt_symbol_path, NtSymbolPathEntry};
 
@@ -19,6 +20,8 @@ pub struct SymbolManagerConfig {
     pub(crate) use_spotlight: bool,
     pub(crate) debuginfod_cache_dir_if_not_installed: Option<PathBuf>,
     pub(crate) debuginfod_servers: Vec<(String, PathBuf)>,
+    pub(crate) extra_symbol_directories: Vec<PathBuf>,
+    pub(crate) simpleperf_binary_cache_directories: Vec<PathBuf>,
 }
 
 impl SymbolManagerConfig {
@@ -65,23 +68,21 @@ impl SymbolManagerConfig {
     }
 
     pub(crate) fn effective_nt_symbol_path(&self) -> Option<Vec<NtSymbolPathEntry>> {
-        let default_downstream_store = symsrv::get_default_downstream_store();
-        let default_downstream_store = default_downstream_store.as_deref();
         let respected_env_value = if self.respect_nt_symbol_path {
             std::env::var("_NT_SYMBOL_PATH").ok()
         } else {
             None
         };
         let mut path = match (respected_env_value, &self.default_nt_symbol_path) {
-            (Some(env_var), _) => Some(parse_nt_symbol_path(&env_var, default_downstream_store)),
-            (None, Some(default)) => Some(parse_nt_symbol_path(default, default_downstream_store)),
+            (Some(env_var), _) => Some(parse_nt_symbol_path(&env_var)),
+            (None, Some(default)) => Some(parse_nt_symbol_path(default)),
             (None, None) => None,
         };
         for (base_url, cache_dir) in &self.windows_servers {
             path.get_or_insert_with(Default::default)
                 .push(NtSymbolPathEntry::Chain {
                     dll: "symsrv.dll".to_string(),
-                    cache_paths: vec![cache_dir.clone()],
+                    cache_paths: vec![symsrv::CachePath::Path(cache_dir.clone())],
                     urls: vec![base_url.clone()],
                 })
         }
@@ -173,6 +174,21 @@ impl SymbolManagerConfig {
     /// of dSYM files based on a mach-O UUID. Ignored on non-macOS.
     pub fn use_spotlight(mut self, use_spotlight: bool) -> Self {
         self.use_spotlight = use_spotlight;
+        self
+    }
+
+    /// Add an additional directory that may contain symbol files.
+    /// We will check "<dir>/<binaryname>" and "<dir>/<debug_name>".
+    pub fn extra_symbols_directory(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.extra_symbol_directories.push(dir.into());
+        self
+    }
+
+    /// Add a simpleperf "binary_cache" directory which will be checked for symbols.
+    ///
+    /// The simpleperf scripts pull files from the Android device into this directory.
+    pub fn simpleperf_binary_cache_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.simpleperf_binary_cache_directories.push(dir.into());
         self
     }
 }

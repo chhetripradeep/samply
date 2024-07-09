@@ -62,7 +62,7 @@
 //! use samply_symbols::debugid::DebugId;
 //! use samply_symbols::{
 //!     CandidatePathInfo, FileAndPathHelper, FileAndPathHelperResult, FileLocation,
-//!     FramesLookupResult, LibraryInfo, OptionallySendFuture, SymbolManager,
+//!     FramesLookupResult, LibraryInfo, LookupAddress, OptionallySendFuture, SymbolManager,
 //! };
 //!
 //! async fn run_query() {
@@ -71,7 +71,7 @@
 //!         artifact_directory: this_dir.join("..").join("fixtures").join("win64-ci"),
 //!     };
 //!
-//!     let symbol_manager = SymbolManager::with_helper(&helper);
+//!     let symbol_manager = SymbolManager::with_helper(helper);
 //!
 //!     let library_info = LibraryInfo {
 //!         debug_name: Some("firefox.pdb".to_string()),
@@ -87,7 +87,7 @@
 //!     };
 //!
 //!     // Look up the symbol for an address.
-//!     let lookup_result = symbol_map.lookup_relative_address(0x1f98f);
+//!     let lookup_result = symbol_map.lookup(LookupAddress::Relative(0x1f98f)).await;
 //!
 //!     match lookup_result {
 //!         Some(address_info) => {
@@ -95,31 +95,14 @@
 //!             println!("0x1f98f: {}", address_info.symbol.name);
 //!
 //!             // See if we have debug info (file name + line, and inlined frames):
-//!             match address_info.frames {
-//!                 FramesLookupResult::Available(frames) => {
-//!                     println!("Debug info:");
-//!                     for frame in frames {
-//!                         println!(
-//!                             " - {:?} ({:?}:{:?})",
-//!                             frame.function, frame.file_path, frame.line_number
-//!                         );
-//!                     }
+//!             if let Some(frames) = address_info.frames {
+//!                 println!("Debug info:");
+//!                 for frame in frames {
+//!                     println!(
+//!                         " - {:?} ({:?}:{:?})",
+//!                         frame.function, frame.file_path, frame.line_number
+//!                     );
 //!                 }
-//!                 FramesLookupResult::External(ext_address) => {
-//!                     // Debug info is located in a different file.
-//!                     if let Some(frames) =
-//!                         symbol_manager.lookup_external(&symbol_map.debug_file_location(), &ext_address).await
-//!                     {
-//!                         println!("Debug info:");
-//!                         for frame in frames {
-//!                             println!(
-//!                                 " - {:?} ({:?}:{:?})",
-//!                                 frame.function, frame.file_path, frame.line_number
-//!                             );
-//!                         }
-//!                     }
-//!                 }
-//!                 FramesLookupResult::Unavailable => {}
 //!             }
 //!         }
 //!         None => {
@@ -132,12 +115,9 @@
 //!     artifact_directory: std::path::PathBuf,
 //! }
 //!
-//! impl<'h> FileAndPathHelper<'h> for ExampleHelper {
+//! impl FileAndPathHelper for ExampleHelper {
 //!     type F = Vec<u8>;
 //!     type FL = ExampleFileLocation;
-//!     type OpenFileFuture = std::pin::Pin<
-//!         Box<dyn OptionallySendFuture<Output = FileAndPathHelperResult<Self::F>> + 'h>,
-//!     >;
 //!
 //!     fn get_candidate_paths_for_debug_file(
 //!         &self,
@@ -173,16 +153,10 @@
 //!    }
 //!
 //!     fn load_file(
-//!         &'h self,
+//!         &self,
 //!         location: ExampleFileLocation,
-//!     ) -> std::pin::Pin<
-//!         Box<dyn OptionallySendFuture<Output = FileAndPathHelperResult<Self::F>> + 'h>,
-//!     > {
-//!         async fn load_file_impl(path: std::path::PathBuf) -> FileAndPathHelperResult<Vec<u8>> {
-//!             Ok(std::fs::read(&path)?)
-//!         }
-//!
-//!         Box::pin(load_file_impl(location.0))
+//!     ) -> std::pin::Pin<Box<dyn OptionallySendFuture<Output = FileAndPathHelperResult<Self::F>> + '_>> {
+//!         Box::pin(async move { Ok(std::fs::read(&location.0)?) })
 //!     }
 //! }
 //!
@@ -217,20 +191,28 @@
 //!     fn location_for_breakpad_symindex(&self) -> Option<Self> {
 //!         Some(Self(self.0.with_extension("symindex")))
 //!     }
+//!
+//!     fn location_for_dwo(&self, _comp_dir: &str, path: &str) -> Option<Self> {
+//!         Some(Self(path.into()))
+//!     }
+//!
+//!     fn location_for_dwp(&self) -> Option<Self> {
+//!         let mut s = self.0.as_os_str().to_os_string();
+//!         s.push(".dwp");
+//!         Some(Self(s.into()))
+//!     }
 //! }
 //! ```
 
-use std::sync::Mutex;
+use std::sync::Arc;
 
 use binary_image::BinaryImageInner;
-pub use debugid;
 use jitdump::JitDumpIndex;
 use linux_perf_data::jitdump::JitDumpReader;
-pub use object;
-pub use pdb_addr2line::pdb;
-
 use object::read::FileKind;
+pub use pdb_addr2line::pdb;
 use shared::FileContentsCursor;
+pub use {debugid, object};
 
 mod binary_image;
 mod breakpad;
@@ -260,6 +242,7 @@ pub use crate::breakpad::{
 pub use crate::cache::{FileByteSource, FileContentsWithChunkedCaching};
 pub use crate::compact_symbol_table::CompactSymbolTable;
 pub use crate::debugid_util::{debug_id_for_object, DebugIdExt};
+pub use crate::demangle::demangle_any;
 pub use crate::error::Error;
 pub use crate::external_file::{load_external_file, ExternalFileSymbolMap};
 pub use crate::jitdump::debug_id_and_code_id_for_jitdump;
@@ -269,33 +252,32 @@ pub use crate::shared::{
     relative_address_base, AddressInfo, CandidatePathInfo, CodeId, ElfBuildId,
     ExternalFileAddressInFileRef, ExternalFileAddressRef, ExternalFileRef, FileAndPathHelper,
     FileAndPathHelperError, FileAndPathHelperResult, FileContents, FileContentsWrapper,
-    FileLocation, FrameDebugInfo, FramesLookupResult, LibraryInfo, MultiArchDisambiguator,
-    OptionallySendFuture, PeCodeId, SourceFilePath, SymbolInfo,
+    FileLocation, FrameDebugInfo, FramesLookupResult, LibraryInfo, LookupAddress,
+    MultiArchDisambiguator, OptionallySendFuture, PeCodeId, SourceFilePath, SymbolInfo,
+    SyncAddressInfo,
 };
-pub use crate::symbol_map::SymbolMap;
+pub use crate::symbol_map::{SymbolMap, SymbolMapTrait};
 
-pub struct SymbolManager<'h, H: FileAndPathHelper<'h>> {
-    helper: &'h H,
-    cached_external_file: Mutex<Option<ExternalFileSymbolMap>>,
+pub struct SymbolManager<H: FileAndPathHelper> {
+    helper: Arc<H>,
 }
 
-impl<'h, H, F, FL> SymbolManager<'h, H>
+impl<H, F, FL> SymbolManager<H>
 where
-    H: FileAndPathHelper<'h, F = F, FL = FL>,
+    H: FileAndPathHelper<F = F, FL = FL>,
     F: FileContents + 'static,
     FL: FileLocation,
 {
     // Create a new `SymbolManager`.
-    pub fn with_helper(helper: &'h H) -> Self {
+    pub fn with_helper(helper: H) -> Self {
         Self {
-            helper,
-            cached_external_file: Mutex::new(None),
+            helper: Arc::new(helper),
         }
     }
 
     /// Exposes the helper.
-    pub fn helper(&self) -> &'h H {
-        self.helper
+    pub fn helper(&self) -> Arc<H> {
+        self.helper.clone()
     }
 
     pub async fn load_source_file(
@@ -321,10 +303,15 @@ where
 
     /// Obtain a symbol map for the library, given the (partial) `LibraryInfo`.
     /// At least the debug_id has to be given.
-    pub async fn load_symbol_map(
-        &self,
-        library_info: &LibraryInfo,
-    ) -> Result<SymbolMap<FL>, Error> {
+    pub async fn load_symbol_map(&self, library_info: &LibraryInfo) -> Result<SymbolMap<H>, Error> {
+        if let Some((fl, symbol_map)) = self
+            .helper()
+            .as_ref()
+            .get_symbol_map_for_library(library_info)
+        {
+            return Ok(SymbolMap::with_symbol_map_trait(fl, symbol_map));
+        }
+
         let debug_id = match library_info.debug_id {
             Some(debug_id) => debug_id,
             None => return Err(Error::NotEnoughInformationToIdentifySymbolMap),
@@ -340,7 +327,7 @@ where
                 )
             })?;
 
-        let mut last_err = None;
+        let mut all_errors = Vec::new();
         for candidate_info in candidate_paths {
             let symbol_map = match candidate_info {
                 CandidatePathInfo::SingleFile(file_location) => {
@@ -354,23 +341,31 @@ where
                     dyld_cache_path,
                     dylib_path,
                 } => {
-                    macho::load_symbol_map_for_dyld_cache(dyld_cache_path, dylib_path, self.helper)
-                        .await
+                    macho::load_symbol_map_for_dyld_cache(
+                        dyld_cache_path,
+                        dylib_path,
+                        &*self.helper,
+                    )
+                    .await
                 }
             };
 
             match symbol_map {
                 Ok(symbol_map) if symbol_map.debug_id() == debug_id => return Ok(symbol_map),
                 Ok(symbol_map) => {
-                    last_err = Some(Error::UnmatchedDebugId(symbol_map.debug_id(), debug_id));
+                    all_errors.push(Error::UnmatchedDebugId(symbol_map.debug_id(), debug_id));
                 }
                 Err(e) => {
-                    last_err = Some(e);
+                    all_errors.push(e);
                 }
             }
         }
-        Err(last_err
-            .unwrap_or_else(|| Error::NoCandidatePathForDebugFile(Box::new(library_info.clone()))))
+        let err = match all_errors.len() {
+            0 => Error::NoCandidatePathForDebugFile(Box::new(library_info.clone())),
+            1 => all_errors.pop().unwrap(),
+            _ => Error::NoSuccessfulCandidate(all_errors),
+        };
+        Err(err)
     }
 
     /// Load and return an external file which may contain additional debug info.
@@ -383,47 +378,17 @@ where
     /// `FramesLookupResult::External` from the lookups. Then the address needs to be
     /// looked up in the external file.
     ///
-    /// Also see `SymbolManager::lookup_external`.
+    /// Also see `SymbolMap::lookup_external`.
     pub async fn load_external_file(
         &self,
         debug_file_location: &H::FL,
-        external_file_ref: &ExternalFileRef,
-    ) -> Result<ExternalFileSymbolMap, Error> {
-        external_file::load_external_file(self.helper, debug_file_location, external_file_ref).await
-    }
-
-    /// Resolve a debug info lookup for which `SymbolMap::lookup_*` returned a
-    /// `FramesLookupResult::External`.
-    ///
-    /// This method is asynchronous because it may load a new external file.
-    ///
-    /// This keeps the most recent external file cached, so that repeated lookups
-    /// for the same external file are fast.
-    pub async fn lookup_external(
-        &self,
-        debug_file_location: &H::FL,
-        address: &ExternalFileAddressRef,
-    ) -> Option<Vec<FrameDebugInfo>> {
-        {
-            let cached_external_file = self.cached_external_file.lock().ok()?;
-            match &*cached_external_file {
-                Some(external_file) if external_file.is_same_file(&address.file_ref) => {
-                    return external_file.lookup(&address.address_in_file);
-                }
-                _ => {}
-            }
-        }
-
-        let external_file = self
-            .load_external_file(debug_file_location, &address.file_ref)
+        external_file_path: &str,
+    ) -> Result<ExternalFileSymbolMap<H::F>, Error> {
+        let external_file_location = debug_file_location
+            .location_for_external_object_file(external_file_path)
+            .ok_or(Error::FileLocationRefusedExternalObjectLocation)?;
+        external_file::load_external_file(&*self.helper, external_file_location, external_file_path)
             .await
-            .ok()?;
-        let lookup_result = external_file.lookup(&address.address_in_file);
-
-        if let Ok(mut guard) = self.cached_external_file.lock() {
-            *guard = Some(external_file);
-        }
-        lookup_result
     }
 
     async fn load_binary_from_dyld_cache(
@@ -431,7 +396,7 @@ where
         dyld_cache_path: FL,
         dylib_path: String,
     ) -> Result<BinaryImage<F>, Error> {
-        macho::load_binary_from_dyld_cache(dyld_cache_path, dylib_path, self.helper).await
+        macho::load_binary_from_dyld_cache(dyld_cache_path, dylib_path, &*self.helper).await
     }
 
     /// Returns the binary for the given (partial) [`LibraryInfo`].
@@ -544,7 +509,7 @@ where
         &self,
         dylib_path: &str,
         multi_arch_disambiguator: Option<MultiArchDisambiguator>,
-    ) -> Result<SymbolMap<FL>, Error> {
+    ) -> Result<SymbolMap<H>, Error> {
         let arch = match &multi_arch_disambiguator {
             Some(MultiArchDisambiguator::Arch(arch)) => Some(arch.as_str()),
             _ => None,
@@ -559,7 +524,7 @@ where
             let symbol_map_res = macho::load_symbol_map_for_dyld_cache(
                 dyld_cache_path,
                 dylib_path.to_owned(),
-                self.helper,
+                &*self.helper,
             )
             .await;
             match (&multi_arch_disambiguator, symbol_map_res) {
@@ -583,7 +548,7 @@ where
         &self,
         file_location: FL,
         multi_arch_disambiguator: Option<MultiArchDisambiguator>,
-    ) -> Result<SymbolMap<FL>, Error> {
+    ) -> Result<SymbolMap<H>, Error> {
         let file_contents = self
             .helper
             .load_file(file_location.clone())
@@ -599,7 +564,7 @@ where
                         file_location,
                         file_contents,
                         file_kind,
-                        self.helper,
+                        self.helper(),
                     )
                     .await
                 }
@@ -613,24 +578,28 @@ where
                         file_location,
                         file_contents,
                         member,
+                        self.helper(),
                     )
                 }
                 FileKind::MachO32 | FileKind::MachO64 => {
-                    macho::get_symbol_map_for_macho(file_location, file_contents)
+                    macho::get_symbol_map_for_macho(file_location, file_contents, self.helper())
                 }
                 FileKind::Pe32 | FileKind::Pe64 => {
                     match windows::load_symbol_map_for_pdb_corresponding_to_binary(
                         file_kind,
                         &file_contents,
                         file_location.clone(),
-                        self.helper,
+                        &*self.helper,
                     )
                     .await
                     {
                         Ok(symbol_map) => Ok(symbol_map),
-                        Err(_) => {
-                            windows::get_symbol_map_for_pe(file_contents, file_kind, file_location)
-                        }
+                        Err(_) => windows::get_symbol_map_for_pe(
+                            file_contents,
+                            file_kind,
+                            file_location,
+                            self.helper(),
+                        ),
                     }
                 }
                 _ => Err(Error::InvalidInputError(
@@ -650,11 +619,9 @@ where
                 } else {
                     None
                 };
-            breakpad::get_symbol_map_for_breakpad_sym(
-                file_contents,
-                file_location,
-                index_file_contents,
-            )
+            let symbol_map =
+                breakpad::get_symbol_map_for_breakpad_sym(file_contents, index_file_contents)?;
+            Ok(SymbolMap::new_plain(file_location, Box::new(symbol_map)))
         } else if jitdump::is_jitdump_file(&file_contents) {
             jitdump::get_symbol_map_for_jitdump(file_contents, file_location)
         } else {

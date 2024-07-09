@@ -1,19 +1,19 @@
-use samply_symbols::debugid::DebugId;
-use samply_symbols::{
-    self, CandidatePathInfo, CompactSymbolTable, Error, FileAndPathHelper, FileAndPathHelperResult,
-    FileLocation, LibraryInfo, MultiArchDisambiguator, OptionallySendFuture, SymbolManager,
-    SymbolMap,
-};
 use std::fs::File;
 use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
 
-async fn get_symbol_map_with_dyld_cache_fallback<'h>(
-    symbol_manager: &SymbolManager<'h, Helper>,
+use samply_symbols::debugid::DebugId;
+use samply_symbols::{
+    self, CandidatePathInfo, CompactSymbolTable, Error, FileAndPathHelper, FileAndPathHelperResult,
+    FileLocation, LibraryInfo, LookupAddress, MultiArchDisambiguator, OptionallySendFuture,
+    SymbolManager, SymbolMap,
+};
+
+async fn get_symbol_map_with_dyld_cache_fallback(
+    symbol_manager: &SymbolManager<Helper>,
     path: &Path,
     debug_id: Option<DebugId>,
-) -> Result<SymbolMap<FileLocationType>, Error> {
+) -> Result<SymbolMap<Helper>, Error> {
     let might_be_in_dyld_shared_cache = path.starts_with("/usr/") || path.starts_with("/System/");
 
     let disambiguator = debug_id.map(MultiArchDisambiguator::DebugId);
@@ -42,7 +42,7 @@ pub async fn get_table(
     let helper = Helper {
         symbol_directory: symbol_file_path.parent().unwrap().to_path_buf(),
     };
-    let symbol_manager = SymbolManager::with_helper(&helper);
+    let symbol_manager = SymbolManager::with_helper(helper);
     let symbol_map =
         get_symbol_map_with_dyld_cache_fallback(&symbol_manager, symbol_file_path, debug_id)
             .await?;
@@ -119,18 +119,25 @@ impl FileLocation for FileLocationType {
     fn location_for_breakpad_symindex(&self) -> Option<Self> {
         Some(Self(self.0.with_extension("symindex")))
     }
+
+    fn location_for_dwo(&self, _comp_dir: &str, _path: &str) -> Option<Self> {
+        None // TODO
+    }
+
+    fn location_for_dwp(&self) -> Option<Self> {
+        let mut s = self.0.as_os_str().to_os_string();
+        s.push(".dwp");
+        Some(Self(s.into()))
+    }
 }
 
 fn mmap_to_file_contents(m: memmap2::Mmap) -> FileContentsType {
     m
 }
 
-impl<'h> FileAndPathHelper<'h> for Helper {
+impl FileAndPathHelper for Helper {
     type F = FileContentsType;
     type FL = FileLocationType;
-
-    type OpenFileFuture =
-        Pin<Box<dyn OptionallySendFuture<Output = FileAndPathHelperResult<Self::F>> + 'h>>;
 
     fn get_candidate_paths_for_debug_file(
         &self,
@@ -172,17 +179,17 @@ impl<'h> FileAndPathHelper<'h> for Helper {
     }
 
     fn load_file(
-        &'h self,
+        &self,
         location: Self::FL,
-    ) -> Pin<Box<dyn OptionallySendFuture<Output = FileAndPathHelperResult<Self::F>> + 'h>> {
-        async fn open_file_impl(path: PathBuf) -> FileAndPathHelperResult<FileContentsType> {
+    ) -> std::pin::Pin<Box<dyn OptionallySendFuture<Output = FileAndPathHelperResult<Self::F>> + '_>>
+    {
+        Box::pin(async {
+            let path = location.0;
             eprintln!("Opening file {:?}", &path);
             let file = File::open(&path)?;
             let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
             Ok(mmap_to_file_contents(mmap))
-        }
-
-        Box::pin(open_file_impl(location.0))
+        })
     }
 
     fn get_candidate_paths_for_binary(
@@ -418,7 +425,7 @@ fn linux_nonzero_base_address() {
     let helper = Helper {
         symbol_directory: fixtures_dir().join("linux64-ci"),
     };
-    let symbol_manager = SymbolManager::with_helper(&helper);
+    let symbol_manager = SymbolManager::with_helper(helper);
     let symbol_map = futures::executor::block_on(symbol_manager.load_symbol_map_from_location(
         FileLocationType(fixtures_dir().join("linux64-ci").join("firefox")),
         None,
@@ -428,10 +435,13 @@ fn linux_nonzero_base_address() {
         symbol_map.debug_id(),
         DebugId::from_breakpad("83CA53B0E8272691CEFCD79178D33D5C0").unwrap()
     );
-    assert_eq!(symbol_map.lookup_relative_address(0x1700), None);
+    assert_eq!(
+        symbol_map.lookup_sync(LookupAddress::Relative(0x1700)),
+        None
+    );
     assert_eq!(
         symbol_map
-            .lookup_relative_address(0x18a0)
+            .lookup_sync(LookupAddress::Relative(0x18a0))
             .unwrap()
             .symbol
             .name,
@@ -439,7 +449,7 @@ fn linux_nonzero_base_address() {
     );
     assert_eq!(
         symbol_map
-            .lookup_relative_address(0x19ea)
+            .lookup_sync(LookupAddress::Relative(0x19ea))
             .unwrap()
             .symbol
             .name,
@@ -447,7 +457,7 @@ fn linux_nonzero_base_address() {
     );
     assert_eq!(
         symbol_map
-            .lookup_relative_address(0x1a60)
+            .lookup_sync(LookupAddress::Relative(0x1a60))
             .unwrap()
             .symbol
             .name,
@@ -467,12 +477,20 @@ fn linux_nonzero_base_address() {
     // [15] .text             PROGBITS        00000000002018a0 0008a0 000232 00  AX  0   0 16
 
     assert_eq!(
-        symbol_map.lookup_offset(0x8a0).unwrap(),
-        symbol_map.lookup_relative_address(0x18a0).unwrap(),
+        symbol_map
+            .lookup_sync(LookupAddress::FileOffset(0x8a0))
+            .unwrap(),
+        symbol_map
+            .lookup_sync(LookupAddress::Relative(0x18a0))
+            .unwrap(),
     );
     assert_eq!(
-        symbol_map.lookup_relative_address(0x18a0).unwrap(),
-        symbol_map.lookup_svma(0x2018a0).unwrap(),
+        symbol_map
+            .lookup_sync(LookupAddress::Relative(0x18a0))
+            .unwrap(),
+        symbol_map
+            .lookup_sync(LookupAddress::Svma(0x2018a0))
+            .unwrap(),
     );
 }
 
@@ -481,7 +499,7 @@ fn example_linux() {
     let helper = Helper {
         symbol_directory: fixtures_dir().join("other"),
     };
-    let symbol_manager = SymbolManager::with_helper(&helper);
+    let symbol_manager = SymbolManager::with_helper(helper);
     let symbol_map = futures::executor::block_on(symbol_manager.load_symbol_map_from_location(
         FileLocationType(fixtures_dir().join("other").join("example-linux")),
         None,
@@ -493,20 +511,20 @@ fn example_linux() {
     );
     assert_eq!(
         &symbol_map
-            .lookup_relative_address(0x1156)
+            .lookup_sync(LookupAddress::Relative(0x1156))
             .unwrap()
             .symbol
             .name,
         "main"
     );
     assert_eq!(
-        symbol_map.lookup_relative_address(0x1158),
+        symbol_map.lookup_sync(LookupAddress::Relative(0x1158)),
         None,
         "Gap between main and f"
     );
     assert_eq!(
         &symbol_map
-            .lookup_relative_address(0x1160)
+            .lookup_sync(LookupAddress::Relative(0x1160))
             .unwrap()
             .symbol
             .name,
@@ -519,7 +537,7 @@ fn example_linux_fallback() {
     let helper = Helper {
         symbol_directory: fixtures_dir().join("other"),
     };
-    let symbol_manager = SymbolManager::with_helper(&helper);
+    let symbol_manager = SymbolManager::with_helper(helper);
     let symbol_map = futures::executor::block_on(symbol_manager.load_symbol_map_from_location(
         FileLocationType(fixtures_dir().join("other").join("example-linux-fallback")),
         None,
@@ -530,7 +548,7 @@ fn example_linux_fallback() {
         DebugId::from_breakpad("C3FC2519F439E42A970B693775586AA80").unwrap()
     );
     // no _stack_chk_fail@@GLIBC_2.4 please
-    assert_eq!(symbol_map.lookup_relative_address(0x6), None);
+    assert_eq!(symbol_map.lookup_sync(LookupAddress::Relative(0x6)), None);
 }
 
 #[test]

@@ -1,18 +1,16 @@
 use debugid::DebugId;
-use linux_perf_data::{jitdump::JitDumpHeader, linux_perf_event_reader::RawData};
-use object::{
-    read::pe::{ImageNtHeaders, ImageOptionalHeader, PeFile, PeFile32, PeFile64},
-    FileKind, Object, ReadRef,
-};
+use linux_perf_data::jitdump::JitDumpHeader;
+use linux_perf_data::linux_perf_event_reader::RawData;
+use object::read::pe::{ImageNtHeaders, ImageOptionalHeader, PeFile, PeFile32, PeFile64};
+use object::{FileKind, Object, ReadRef};
 
-use crate::{
-    debug_id_and_code_id_for_jitdump, debug_id_for_object,
-    debugid_util::code_id_for_object,
-    jitdump::JitDumpIndex,
-    macho::{DyldCacheFileData, MachOData, MachOFatArchiveMemberData, ObjectAndMachOData},
-    relative_address_base,
-    shared::{FileContentsWrapper, LibraryInfo, PeCodeId, RangeReadRef},
-    CodeId, ElfBuildId, Error, FileAndPathHelperError, FileContents,
+use crate::debugid_util::{code_id_for_object, debug_id_for_object};
+use crate::error::Error;
+use crate::jitdump::{debug_id_and_code_id_for_jitdump, JitDumpIndex};
+use crate::macho::{DyldCacheFileData, MachOData, MachOFatArchiveMemberData};
+use crate::shared::{
+    relative_address_base, CodeId, ElfBuildId, FileAndPathHelperError, FileContents,
+    FileContentsWrapper, LibraryInfo, PeCodeId, RangeReadRef,
 };
 
 #[derive(thiserror::Error, Debug)]
@@ -151,14 +149,13 @@ impl<F: FileContents> BinaryImageInner<F> {
                 let debug_id = debug_id_for_object(&object);
                 let code_id = code_id_for_object(&object);
                 let (debug_path, debug_name) = (path.clone(), name.clone());
-                let arch = member.arch.clone();
+                let arch = member.arch();
                 (debug_id, code_id, debug_path, debug_name, arch)
             }
             BinaryImageInner::MemberOfDyldSharedCache(dyld_cache_file_data) => {
-                let ObjectAndMachOData { object, macho_data } =
-                    dyld_cache_file_data.make_object()?;
-                let debug_id = debug_id_for_object(&object);
-                let code_id = code_id_for_object(&object);
+                let (obj, macho_data) = dyld_cache_file_data.make_object()?.into_parts();
+                let debug_id = debug_id_for_object(&obj);
+                let code_id = code_id_for_object(&obj);
                 let (debug_path, debug_name) = (path.clone(), name.clone());
                 let arch = macho_data.get_arch().map(ToOwned::to_owned);
                 (debug_id, code_id, debug_path, debug_name, arch)
@@ -210,8 +207,8 @@ impl<F: FileContents> BinaryImageInner<F> {
                 Ok(Some(obj))
             }
             BinaryImageInner::MemberOfDyldSharedCache(dyld_cache_file_data) => {
-                let obj_and_macho_data = dyld_cache_file_data.make_object()?;
-                Ok(Some(obj_and_macho_data.object))
+                let (obj, _) = dyld_cache_file_data.make_object()?.into_parts();
+                Ok(Some(obj))
             }
             BinaryImageInner::JitDump(_file, _index) => Ok(None),
         }

@@ -1,16 +1,11 @@
 use std::cell::RefCell;
 use std::cmp::max;
 use std::collections::BinaryHeap;
-use std::io;
-use std::mem;
 use std::ops::Range;
 use std::os::unix::io::RawFd;
-use std::ptr;
 use std::rc::Rc;
-use std::slice;
-use std::sync::atomic::fence;
-use std::sync::atomic::Ordering;
-use std::{cmp, fmt};
+use std::sync::atomic::{fence, Ordering};
+use std::{cmp, fmt, io, mem, ptr, slice};
 
 use libc::{self, c_void, pid_t};
 use linux_perf_data::linux_perf_event_reader;
@@ -399,10 +394,9 @@ impl PerfBuilder {
         let attr_bytes_ptr = &attr as *const PerfEventAttr as *const u8;
         let attr_bytes_len = mem::size_of::<PerfEventAttr>();
         let attr_bytes = unsafe { slice::from_raw_parts(attr_bytes_ptr, attr_bytes_len) };
-        let attr2 = linux_perf_event_reader::PerfEventAttr::parse::<_, byteorder::NativeEndian>(
-            attr_bytes, None,
-        )
-        .unwrap();
+        let (attr2, _size) =
+            linux_perf_event_reader::PerfEventAttr::parse::<_, byteorder::NativeEndian>(attr_bytes)
+                .unwrap();
         let parse_info = RecordParseInfo::new(&attr2, Endianness::NATIVE);
 
         // debug!("Perf events open with fd={}", fd);

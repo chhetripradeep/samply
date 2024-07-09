@@ -1,8 +1,13 @@
-use crate::to_debug_id;
-use crate::{api_file_path::to_api_file_path, error::Error};
-use samply_symbols::{FileAndPathHelper, FramesLookupResult, LibraryInfo, SymbolManager};
 use std::collections::HashMap;
 use std::num::NonZeroU32;
+
+use samply_symbols::{
+    FileAndPathHelper, FramesLookupResult, LibraryInfo, LookupAddress, SymbolManager,
+};
+
+use crate::api_file_path::to_api_file_path;
+use crate::error::Error;
+use crate::to_debug_id;
 
 pub mod looked_up_addresses;
 pub mod request_json;
@@ -12,13 +17,13 @@ use looked_up_addresses::{AddressResults, LookedUpAddresses};
 use request_json::Lib;
 use serde_json::json;
 
-pub struct SymbolicateApi<'a, 'h: 'a, H: FileAndPathHelper<'h>> {
-    symbol_manager: &'a SymbolManager<'h, H>,
+pub struct SymbolicateApi<'a, H: FileAndPathHelper> {
+    symbol_manager: &'a SymbolManager<H>,
 }
 
-impl<'a, 'h: 'a, H: FileAndPathHelper<'h>> SymbolicateApi<'a, 'h, H> {
+impl<'a, H: FileAndPathHelper> SymbolicateApi<'a, H> {
     /// Create a [`SymbolicateApi`] instance which uses the provided [`SymbolManager`].
-    pub fn new(symbol_manager: &'a SymbolManager<'h, H>) -> Self {
+    pub fn new(symbol_manager: &'a SymbolManager<H>) -> Self {
         Self { symbol_manager }
     }
 
@@ -74,57 +79,48 @@ impl<'a, 'h: 'a, H: FileAndPathHelper<'h>> SymbolicateApi<'a, 'h, H> {
 
         let mut symbolication_result = LookedUpAddresses::for_addresses(&addresses);
         let mut external_addresses = Vec::new();
-        let debug_file_location;
 
-        // Do the synchronous work first, and keep the symbol_map in a scope without
-        // any other await calls so that the Rust compiler can see that the symbol
-        // map does not exist across any await calls. This makes it so that the
-        // future defined by this async function is Send even if the symbol map is
-        // not Send.
-        {
-            let info = LibraryInfo {
-                debug_name: Some(lib.debug_name.to_string()),
-                debug_id: Some(debug_id),
-                ..Default::default()
-            };
-            let symbol_map = self.symbol_manager.load_symbol_map(&info).await?;
-            debug_file_location = symbol_map.debug_file_location().clone();
+        // Do the synchronous work first, and accumulate external_addresses which need
+        // to be handled asynchronously. This allows us to group async file loads by
+        // the external file.
 
-            symbolication_result.set_total_symbol_count(symbol_map.symbol_count() as u32);
+        let info = LibraryInfo {
+            debug_name: Some(lib.debug_name.to_string()),
+            debug_id: Some(debug_id),
+            ..Default::default()
+        };
+        let symbol_map = self.symbol_manager.load_symbol_map(&info).await?;
 
-            for &address in &addresses {
-                if let Some(address_info) = symbol_map.lookup_relative_address(address) {
-                    symbolication_result.add_address_symbol(
-                        address,
-                        address_info.symbol.address,
-                        address_info.symbol.name,
-                        address_info.symbol.size,
-                    );
-                    match address_info.frames {
-                        FramesLookupResult::Available(frames) => {
-                            symbolication_result.add_address_debug_info(address, frames)
-                        }
-                        FramesLookupResult::External(ext_address) => {
-                            external_addresses.push((address, ext_address));
-                        }
-                        FramesLookupResult::Unavailable => {}
+        symbolication_result.set_total_symbol_count(symbol_map.symbol_count() as u32);
+
+        for &address in &addresses {
+            if let Some(address_info) = symbol_map.lookup_sync(LookupAddress::Relative(address)) {
+                symbolication_result.add_address_symbol(
+                    address,
+                    address_info.symbol.address,
+                    address_info.symbol.name,
+                    address_info.symbol.size,
+                );
+                match address_info.frames {
+                    Some(FramesLookupResult::Available(frames)) => {
+                        symbolication_result.add_address_debug_info(address, frames)
                     }
+                    Some(FramesLookupResult::External(ext_address)) => {
+                        external_addresses.push((address, ext_address));
+                    }
+                    None => {}
                 }
             }
         }
 
         // Look up any addresses whose debug info is in an external file.
-        // The symbol_manager caches the most recent external file.
-        // Since our addresses are sorted, they usually happen to be grouped by external
-        // file, so in practice we don't do much (if any) repeated reading of the same
-        // external file.
+        // The symbol_manager caches the most recent external file, so we sort our
+        // external addresses by ExternalFileAddressRef before we do the lookup,
+        // in order to get the best hit rate in lookup_external.
+        external_addresses.sort_unstable_by(|(_, a), (_, b)| a.cmp(b));
 
         for (address, ext_address) in external_addresses {
-            if let Some(frames) = self
-                .symbol_manager
-                .lookup_external(&debug_file_location, &ext_address)
-                .await
-            {
+            if let Some(frames) = symbol_map.lookup_external(&ext_address).await {
                 symbolication_result.add_address_debug_info(address, frames);
             }
         }

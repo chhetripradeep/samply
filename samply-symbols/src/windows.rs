@@ -1,16 +1,8 @@
-use crate::debugid_util::debug_id_for_object;
-use crate::error::{Context, Error};
-use crate::path_mapper::{ExtraPathMapper, PathMapper};
-use crate::shared::{
-    AddressInfo, FileAndPathHelper, FileContents, FileContentsWrapper, FrameDebugInfo,
-    FramesLookupResult, SymbolInfo,
-};
-use crate::symbol_map::{
-    GenericSymbolMap, SymbolMap, SymbolMapDataMidTrait, SymbolMapDataOuterTrait,
-    SymbolMapInnerWrapper, SymbolMapTrait,
-};
-use crate::symbol_map_object::{FunctionAddressesComputer, ObjectSymbolMapDataMid};
-use crate::{demangle, FileLocation, MappedPath, SourceFilePath};
+use std::borrow::Cow;
+use std::collections::HashMap;
+use std::ops::Deref;
+use std::sync::{Arc, Mutex};
+
 use debugid::DebugId;
 use nom::bytes::complete::{tag, take_until1};
 use nom::combinator::eof;
@@ -18,21 +10,30 @@ use nom::sequence::terminated;
 use object::{File, FileKind};
 use pdb::PDB;
 use pdb_addr2line::pdb;
-use std::borrow::Cow;
-use std::collections::HashMap;
-use std::ops::Deref;
-use std::sync::Mutex;
+use yoke::Yoke;
+use yoke_derive::Yokeable;
 
-pub async fn load_symbol_map_for_pdb_corresponding_to_binary<
-    'h,
-    H: FileAndPathHelper<'h, FL = FL>,
-    FL: FileLocation,
->(
+use crate::debugid_util::debug_id_for_object;
+use crate::dwarf::Addr2lineContextData;
+use crate::error::{Context, Error};
+use crate::mapped_path::MappedPath;
+use crate::path_mapper::{ExtraPathMapper, PathMapper};
+use crate::shared::{
+    FileAndPathHelper, FileContents, FileContentsWrapper, FileLocation, FrameDebugInfo,
+    FramesLookupResult, LookupAddress, SourceFilePath, SymbolInfo,
+};
+use crate::symbol_map::{GetInnerSymbolMap, SymbolMap, SymbolMapTrait};
+use crate::symbol_map_object::{
+    ObjectSymbolMap, ObjectSymbolMapInnerWrapper, ObjectSymbolMapOuter,
+};
+use crate::{demangle, SyncAddressInfo};
+
+pub async fn load_symbol_map_for_pdb_corresponding_to_binary<H: FileAndPathHelper>(
     file_kind: FileKind,
-    file_contents: &FileContentsWrapper<impl FileContents + 'static>,
-    file_location: FL,
-    helper: &'h H,
-) -> Result<SymbolMap<FL>, Error> {
+    file_contents: &FileContentsWrapper<H::F>,
+    file_location: H::FL,
+    helper: &H,
+) -> Result<SymbolMap<H>, Error> {
     use object::Object;
     let pe =
         object::File::parse(file_contents).map_err(|e| Error::ObjectParseError(file_kind, e))?;
@@ -62,81 +63,97 @@ pub async fn load_symbol_map_for_pdb_corresponding_to_binary<
     Ok(symbol_map)
 }
 
-pub fn get_symbol_map_for_pe<F, FL>(
-    file_contents: FileContentsWrapper<F>,
+pub fn get_symbol_map_for_pe<H: FileAndPathHelper>(
+    file_contents: FileContentsWrapper<H::F>,
     file_kind: FileKind,
-    file_location: FL,
-) -> Result<SymbolMap<FL>, Error>
-where
-    F: FileContents + 'static,
-    FL: FileLocation,
-{
-    let owner = PeSymbolMapData::new(file_contents, file_kind);
-    let symbol_map = GenericSymbolMap::new(owner)?;
-    Ok(SymbolMap::new(file_location, Box::new(symbol_map)))
+    file_location: H::FL,
+    helper: Arc<H>,
+) -> Result<SymbolMap<H>, Error> {
+    let owner = PeSymbolMapDataAndObject::new(file_contents, file_kind)?;
+    let symbol_map = ObjectSymbolMap::new(owner)?;
+    Ok(SymbolMap::new_with_external_file_support(
+        file_location,
+        Box::new(symbol_map),
+        helper,
+    ))
 }
 
-struct PeSymbolMapData<T>
-where
-    T: FileContents,
-{
-    file_data: FileContentsWrapper<T>,
-    file_kind: FileKind,
+#[derive(Yokeable)]
+struct PeObject<'data, T: FileContents> {
+    file_data: &'data FileContentsWrapper<T>,
+    object: File<'data, &'data FileContentsWrapper<T>>,
+    addr2line_context: Addr2lineContextData,
 }
 
-impl<T: FileContents> PeSymbolMapData<T> {
-    pub fn new(file_data: FileContentsWrapper<T>, file_kind: FileKind) -> Self {
+impl<'data, T: FileContents> PeObject<'data, T> {
+    pub fn new(
+        file_data: &'data FileContentsWrapper<T>,
+        object: File<'data, &'data FileContentsWrapper<T>>,
+    ) -> Self {
         Self {
             file_data,
-            file_kind,
+            object,
+            addr2line_context: Addr2lineContextData::new(),
         }
     }
 }
 
-impl<T: FileContents + 'static> SymbolMapDataOuterTrait for PeSymbolMapData<T> {
-    fn make_symbol_map_data_mid(
-        &self,
-    ) -> Result<Box<dyn SymbolMapDataMidTrait + Send + '_>, Error> {
-        let object =
-            File::parse(&self.file_data).map_err(|e| Error::ObjectParseError(self.file_kind, e))?;
-        let debug_id = debug_id_for_object(&object)
-            .ok_or(Error::InvalidInputError("debug ID cannot be read"))?;
-        let object = ObjectSymbolMapDataMid::new(
+struct PeSymbolMapDataAndObject<T: FileContents + 'static>(
+    Yoke<PeObject<'static, T>, Box<FileContentsWrapper<T>>>,
+);
+impl<T: FileContents + 'static> PeSymbolMapDataAndObject<T> {
+    pub fn new(file_data: FileContentsWrapper<T>, file_kind: FileKind) -> Result<Self, Error> {
+        let data_and_object = Yoke::try_attach_to_cart(
+            Box::new(file_data),
+            move |file_data| -> Result<PeObject<'_, T>, Error> {
+                let object =
+                    File::parse(file_data).map_err(|e| Error::ObjectParseError(file_kind, e))?;
+                Ok(PeObject::new(file_data, object))
+            },
+        )?;
+        Ok(Self(data_and_object))
+    }
+}
+
+impl<T: FileContents + 'static> ObjectSymbolMapOuter<T> for PeSymbolMapDataAndObject<T> {
+    fn make_symbol_map_inner(&self) -> Result<ObjectSymbolMapInnerWrapper<T>, Error> {
+        let PeObject {
+            file_data,
             object,
-            None,
-            PeFunctionAddressesComputer,
-            &self.file_data,
-            None,
+            addr2line_context,
+        } = &self.0.get();
+        let debug_id = debug_id_for_object(object)
+            .ok_or(Error::InvalidInputError("debug ID cannot be read"))?;
+        let (function_starts, function_ends) = compute_function_addresses_pe(object);
+        let symbol_map = ObjectSymbolMapInnerWrapper::new(
+            object,
+            addr2line_context
+                .make_context(*file_data, object, None, None)
+                .ok(),
             None,
             debug_id,
+            function_starts.as_deref(),
+            function_ends.as_deref(),
+            &(),
         );
 
-        Ok(Box::new(object))
+        Ok(symbol_map)
     }
 }
 
-struct PeFunctionAddressesComputer;
-
-impl<'data> FunctionAddressesComputer<'data> for PeFunctionAddressesComputer {
-    fn compute_function_addresses<'file, O>(
-        &'file self,
-        object_file: &'file O,
-    ) -> (Option<Vec<u32>>, Option<Vec<u32>>)
-    where
-        'data: 'file,
-        O: object::Object<'data, 'file>,
+fn compute_function_addresses_pe<'data, O: object::Object<'data>>(
+    object_file: &O,
+) -> (Option<Vec<u32>>, Option<Vec<u32>>) {
+    // Get function start and end addresses from the function list in .pdata.
+    use object::ObjectSection;
+    if let Some(pdata) = object_file
+        .section_by_name_bytes(b".pdata")
+        .and_then(|s| s.data().ok())
     {
-        // Get function start and end addresses from the function list in .pdata.
-        use object::ObjectSection;
-        if let Some(pdata) = object_file
-            .section_by_name_bytes(b".pdata")
-            .and_then(|s| s.data().ok())
-        {
-            let (s, e) = function_start_and_end_addresses(pdata);
-            (Some(s), Some(e))
-        } else {
-            (None, None)
-        }
+        let (s, e) = function_start_and_end_addresses(pdata);
+        (Some(s), Some(e))
+    } else {
+        (None, None)
     }
 }
 
@@ -150,8 +167,15 @@ struct PdbObject<'data, FC: FileContents + 'static> {
     srcsrv_stream: Option<Box<dyn Deref<Target = [u8]> + Send + 'data>>,
 }
 
-impl<'data, FC: FileContents + 'static> SymbolMapDataMidTrait for PdbObject<'data, FC> {
-    fn make_symbol_map_inner(&self) -> Result<SymbolMapInnerWrapper<'_>, Error> {
+trait PdbObjectTrait {
+    fn make_pdb_symbol_map(&self) -> Result<PdbSymbolMapInner<'_>, Error>;
+}
+
+#[derive(Yokeable)]
+pub struct PdbObjectWrapper<'data>(Box<dyn PdbObjectTrait + Send + 'data>);
+
+impl<'data, FC: FileContents + 'static> PdbObjectTrait for PdbObject<'data, FC> {
+    fn make_pdb_symbol_map(&self) -> Result<PdbSymbolMapInner<'_>, Error> {
         let context = self.make_context()?;
 
         let path_mapper = match &self.srcsrv_stream {
@@ -167,7 +191,7 @@ impl<'data, FC: FileContents + 'static> SymbolMapDataMidTrait for PdbObject<'dat
             debug_id: self.debug_id,
             path_mapper: Mutex::new(path_mapper),
         };
-        Ok(SymbolMapInnerWrapper(Box::new(symbol_map)))
+        Ok(symbol_map)
     }
 }
 
@@ -206,6 +230,9 @@ impl<'a, 's> PdbAddr2lineContextTrait for pdb_addr2line::Context<'a, 's> {
     }
 }
 
+#[derive(Yokeable)]
+pub struct PdbSymbolMapInnerWrapper<'data>(Box<dyn SymbolMapTrait + Send + 'data>);
+
 struct PdbSymbolMapInner<'object> {
     context: Box<dyn PdbAddr2lineContextTrait + Send + 'object>,
     debug_id: DebugId,
@@ -232,8 +259,21 @@ impl<'object> SymbolMapTrait for PdbSymbolMapInner<'object> {
         Box::new(iter)
     }
 
-    fn lookup_relative_address(&self, address: u32) -> Option<AddressInfo> {
-        let function_frames = self.context.find_frames(address).ok()??;
+    fn lookup_sync(&self, address: LookupAddress) -> Option<SyncAddressInfo> {
+        let rva = match address {
+            LookupAddress::Relative(rva) => rva,
+            LookupAddress::Svma(_) => {
+                // TODO: Convert svma into rva by subtracting the image base address.
+                // Does the PDB know about the image base address?
+                return None;
+            }
+            LookupAddress::FileOffset(_) => {
+                // TODO
+                // Does the PDB know at which file offsets the sections are stored in the binary?
+                return None;
+            }
+        };
+        let function_frames = self.context.find_frames(rva).ok()??;
         let symbol_address = function_frames.start_rva;
         let symbol_name = match &function_frames.frames.last().unwrap().function {
             Some(name) => demangle::demangle_any(name),
@@ -263,23 +303,12 @@ impl<'object> SymbolMapTrait for PdbSymbolMapInner<'object> {
                     line_number: frame.line,
                 })
                 .collect();
-            FramesLookupResult::Available(frames)
+            Some(FramesLookupResult::Available(frames))
         } else {
-            FramesLookupResult::Unavailable
+            None
         };
 
-        Some(AddressInfo { symbol, frames })
-    }
-
-    fn lookup_svma(&self, _svma: u64) -> Option<AddressInfo> {
-        // TODO: Convert svma into rva by subtracting the image base address.
-        // Does the PDB know about the image base address?
-        None
-    }
-
-    fn lookup_offset(&self, _offset: u64) -> Option<AddressInfo> {
-        // TODO
-        None
+        Some(SyncAddressInfo { symbol, frames })
     }
 }
 
@@ -290,45 +319,108 @@ where
     Box::new(stream)
 }
 
-struct PdbSymbolData<T: FileContents + 'static>(FileContentsWrapper<T>);
+struct PdbFileData<T: FileContents + 'static>(FileContentsWrapper<T>);
 
-impl<T: FileContents + 'static> SymbolMapDataOuterTrait for PdbSymbolData<T> {
-    fn make_symbol_map_data_mid(
-        &self,
-    ) -> Result<Box<dyn SymbolMapDataMidTrait + Send + '_>, Error> {
-        let mut pdb = PDB::open(&self.0)?;
-        let info = pdb.pdb_information().context("pdb_information")?;
-        let dbi = pdb.debug_information()?;
-        let age = dbi.age().unwrap_or(info.age);
-        let debug_id = DebugId::from_parts(info.guid, age);
+pub struct PdbObjectWithFileData<T: FileContents + 'static>(
+    Yoke<PdbObjectWrapper<'static>, Box<PdbFileData<T>>>,
+);
 
-        let srcsrv_stream = match pdb.named_stream(b"srcsrv") {
-            Ok(stream) => Some(box_stream(stream)),
-            Err(pdb::Error::StreamNameNotFound | pdb::Error::StreamNotFound(_)) => None,
-            Err(e) => return Err(Error::PdbError("pdb.named_stream(srcsrv)", e)),
-        };
+impl<T: FileContents + 'static> PdbObjectWithFileData<T> {
+    fn new(file_data: PdbFileData<T>) -> Result<Self, Error> {
+        let data_and_object = Yoke::try_attach_to_cart(Box::new(file_data), |file_data| {
+            let mut pdb = PDB::open(&file_data.0)?;
+            let info = pdb.pdb_information().context("pdb_information")?;
+            let dbi = pdb.debug_information()?;
+            let age = dbi.age().unwrap_or(info.age);
+            let debug_id = DebugId::from_parts(info.guid, age);
 
-        let context_data = pdb_addr2line::ContextPdbData::try_from_pdb(pdb)
-            .context("ContextConstructionData::try_from_pdb")?;
+            let srcsrv_stream = match pdb.named_stream(b"srcsrv") {
+                Ok(stream) => Some(box_stream(stream)),
+                Err(pdb::Error::StreamNameNotFound | pdb::Error::StreamNotFound(_)) => None,
+                Err(e) => return Err(Error::PdbError("pdb.named_stream(srcsrv)", e)),
+            };
 
-        Ok(Box::new(PdbObject {
-            context_data,
-            debug_id,
-            srcsrv_stream,
-        }))
+            let context_data = pdb_addr2line::ContextPdbData::try_from_pdb(pdb)
+                .context("ContextConstructionData::try_from_pdb")?;
+
+            let pdb_object = PdbObject {
+                context_data,
+                debug_id,
+                srcsrv_stream,
+            };
+
+            Ok(PdbObjectWrapper(Box::new(pdb_object)))
+        })?;
+        Ok(PdbObjectWithFileData(data_and_object))
     }
 }
 
-pub fn get_symbol_map_for_pdb<F, FL>(
-    file_contents: FileContentsWrapper<F>,
-    debug_file_location: FL,
-) -> Result<SymbolMap<FL>, Error>
-where
-    F: FileContents + 'static,
-    FL: FileLocation,
-{
-    let symbol_map = GenericSymbolMap::new(PdbSymbolData(file_contents))?;
-    Ok(SymbolMap::new(debug_file_location, Box::new(symbol_map)))
+pub struct PdbSymbolMap<T: FileContents + 'static>(
+    Mutex<Yoke<PdbSymbolMapInnerWrapper<'static>, Box<PdbObjectWithFileData<T>>>>,
+);
+
+impl<T: FileContents> PdbSymbolMap<T> {
+    pub fn new(outer: PdbObjectWithFileData<T>) -> Result<Self, Error> {
+        let outer_and_inner = Yoke::try_attach_to_cart(
+            Box::new(outer),
+            |outer| -> Result<PdbSymbolMapInnerWrapper<'_>, Error> {
+                let maker = outer.0.get().0.as_ref();
+                let symbol_map = maker.make_pdb_symbol_map()?;
+                Ok(PdbSymbolMapInnerWrapper(Box::new(symbol_map)))
+            },
+        )?;
+        Ok(PdbSymbolMap(Mutex::new(outer_and_inner)))
+    }
+
+    fn with_inner<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&dyn SymbolMapTrait) -> R,
+    {
+        f(&*self.0.lock().unwrap().get().0)
+    }
+}
+
+impl<T: FileContents> GetInnerSymbolMap for PdbSymbolMap<T> {
+    fn get_inner_symbol_map<'a>(&'a self) -> &'a (dyn SymbolMapTrait + 'a) {
+        self
+    }
+}
+
+impl<T: FileContents> SymbolMapTrait for PdbSymbolMap<T> {
+    fn debug_id(&self) -> debugid::DebugId {
+        self.with_inner(|inner| inner.debug_id())
+    }
+
+    fn symbol_count(&self) -> usize {
+        self.with_inner(|inner| inner.symbol_count())
+    }
+
+    fn iter_symbols(&self) -> Box<dyn Iterator<Item = (u32, Cow<'_, str>)> + '_> {
+        let vec = self.with_inner(|inner| {
+            let vec: Vec<_> = inner
+                .iter_symbols()
+                .map(|(addr, s)| (addr, s.to_string()))
+                .collect();
+            vec
+        });
+        Box::new(vec.into_iter().map(|(addr, s)| (addr, Cow::Owned(s))))
+    }
+
+    fn lookup_sync(&self, address: LookupAddress) -> Option<SyncAddressInfo> {
+        self.with_inner(|inner| inner.lookup_sync(address))
+    }
+}
+
+pub fn get_symbol_map_for_pdb<H: FileAndPathHelper>(
+    file_contents: FileContentsWrapper<H::F>,
+    debug_file_location: H::FL,
+) -> Result<SymbolMap<H>, Error> {
+    let file_data_and_object = PdbObjectWithFileData::new(PdbFileData(file_contents))?;
+    let symbol_map = PdbSymbolMap::new(file_data_and_object)?;
+    Ok(SymbolMap::new_plain(
+        debug_file_location,
+        Box::new(symbol_map),
+    ))
 }
 
 /// Map raw file paths to special "permalink" paths, using the srcsrv stream.

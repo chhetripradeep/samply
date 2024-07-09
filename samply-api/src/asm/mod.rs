@@ -1,16 +1,16 @@
 use std::str::FromStr;
 
+use samply_symbols::debugid::DebugId;
 use samply_symbols::{
-    debugid::DebugId, object, CodeByteReadingError, CodeId, FileAndPathHelper,
-    FileAndPathHelperError, LibraryInfo, SymbolManager,
+    object, CodeByteReadingError, CodeId, FileAndPathHelper, FileAndPathHelperError, LibraryInfo,
+    LookupAddress, SymbolManager,
 };
 use serde_json::json;
 use yaxpeax_arch::{Arch, DecodeError, LengthedInstruction, Reader, U8Reader};
 use yaxpeax_x86::amd64::{Opcode, Operand};
 
-use crate::asm::response_json::DecodedInstruction;
-
 use self::response_json::Response;
+use crate::asm::response_json::DecodedInstruction;
 
 mod request_json;
 mod response_json;
@@ -39,13 +39,13 @@ enum AsmError {
     FileIO(#[from] FileAndPathHelperError),
 }
 
-pub struct AsmApi<'a, 'h: 'a, H: FileAndPathHelper<'h>> {
-    symbol_manager: &'a SymbolManager<'h, H>,
+pub struct AsmApi<'a, H: FileAndPathHelper> {
+    symbol_manager: &'a SymbolManager<H>,
 }
 
-impl<'a, 'h: 'a, H: FileAndPathHelper<'h>> AsmApi<'a, 'h, H> {
+impl<'a, H: FileAndPathHelper> AsmApi<'a, H> {
     /// Create an [`AsmApi`] instance which uses the provided [`SymbolManager`].
-    pub fn new(symbol_manager: &'a SymbolManager<'h, H>) -> Self {
+    pub fn new(symbol_manager: &'a SymbolManager<H>) -> Self {
         Self { symbol_manager }
     }
 
@@ -159,7 +159,7 @@ impl<'a, 'h: 'a, H: FileAndPathHelper<'h>> AsmApi<'a, 'h, H> {
         let symbol_map_res = self.symbol_manager.load_symbol_map(library_info).await;
         let symbol = symbol_map_res
             .ok()?
-            .lookup_relative_address(address_within_function)?
+            .lookup_sync(LookupAddress::Relative(address_within_function))?
             .symbol;
         symbol.address.checked_add(symbol.size?)
     }
@@ -248,21 +248,23 @@ impl InstructionDecoding for yaxpeax_x86::amd64::Arch {
 
         if is_relative_branch(inst.opcode()) {
             match inst.operand(0) {
-                Operand::ImmediateI8(rel) => {
+                Operand::ImmediateI8 { imm } => {
+                    let rel = imm;
                     let dest = rel_address as i64
                         + offset as i64
                         + inst.len().to_const() as i64
                         + rel as i64;
                     intel_insn = format!("{} 0x{:x}", inst.opcode(), dest);
-                    c_insn = intel_insn.clone();
+                    c_insn.clone_from(&intel_insn);
                 }
-                Operand::ImmediateI32(rel) => {
+                Operand::ImmediateI32 { imm } => {
+                    let rel = imm;
                     let dest = rel_address as i64
                         + offset as i64
                         + inst.len().to_const() as i64
                         + rel as i64;
                     intel_insn = format!("{} 0x{:x}", inst.opcode(), dest);
-                    c_insn = intel_insn.clone();
+                    c_insn.clone_from(&intel_insn);
                 }
                 _ => {}
             };

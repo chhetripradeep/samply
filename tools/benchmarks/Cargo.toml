@@ -4,19 +4,20 @@ version = "0.1.0"
 authors = ["Markus Stange <mstange@themasta.com>"]
 license = "MIT OR Apache-2.0"
 edition = "2021"
+publish = false
 
 [dependencies]
 dump-table = { path = "../dump_table" }
 query-api = { path = "../query_api" }
-reqwest = { version = "0.11.6", default-features = false, features = [
+reqwest = { version = "0.12", default-features = false, features = [
   "rustls-tls",
   "gzip",
   "blocking"
 ] }
-anyhow = "1.0.28"
-tempfile = "3.4.0"
+anyhow = "1.0.86"
+tempfile = "3.10.1"
 futures = "0.3.5"
-cab = "0.4.1"
-flate2 = "1.0.14"
-tar = "0.4.26"
+cab = "0.6.0"
+flate2 = "1.0.30"
+tar = "0.4.41"
 bzip2 = "0.4.3"

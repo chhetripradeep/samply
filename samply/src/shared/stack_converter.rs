@@ -1,7 +1,7 @@
 use fxprof_processed_profile::{CategoryPairHandle, Frame, FrameFlags, FrameInfo};
 
 use super::jit_category_manager::{JsFrame, JsName};
-use super::lib_mappings::LibMappingsHierarchy;
+use super::lib_mappings::{AndroidArtInfo, LibMappingsHierarchy};
 use super::types::{StackFrame, StackMode};
 
 #[derive(Debug, Clone, Copy)]
@@ -15,8 +15,10 @@ pub struct ConvertedStackIter<'a> {
     lib_mappings: &'a LibMappingsHierarchy,
     user_category: CategoryPairHandle,
     kernel_category: CategoryPairHandle,
-    pending_frame: Option<FrameInfo>,
+    pending_frame_info: Option<FrameInfo>,
+    pending_frame: Option<&'a StackFrame>,
     js_name_for_baseline_interpreter: Option<JsName>,
+    previous_frame_was_dex_or_oat: bool,
 }
 
 impl<'a> Iterator for ConvertedStackIter<'a> {
@@ -33,18 +35,17 @@ impl<'a> Iterator for ConvertedStackIter<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            if let Some(pending_frame) = self.pending_frame.take() {
-                return Some(pending_frame);
+            if let Some(pending_frame_info) = self.pending_frame_info.take() {
+                return Some(pending_frame_info);
             }
-            let frame = self.inner.next()?;
-            let (mode, addr, lookup_address, from_ip) = match *frame {
-                StackFrame::InstructionPointer(addr, mode) => (mode, addr, addr, true),
-                StackFrame::ReturnAddress(addr, mode) => {
-                    (mode, addr, addr.saturating_sub(1), false)
-                }
+            let frame = self.pending_frame.take().or_else(|| self.inner.next())?;
+            let (mode, lookup_address, from_ip) = match *frame {
+                StackFrame::InstructionPointer(addr, mode) => (mode, addr, true),
+                StackFrame::ReturnAddress(addr, mode) => (mode, addr.saturating_sub(1), false),
+                StackFrame::AdjustedReturnAddress(addr, mode) => (mode, addr, false),
                 StackFrame::TruncatedStackMarker => continue,
             };
-            let (location, category, js_frame) = match mode {
+            let (location, category, js_frame, art_info) = match mode {
                 StackMode::User => match self.lib_mappings.convert_address(lookup_address) {
                     Some((relative_lookup_address, info)) => {
                         let location = if from_ip {
@@ -54,34 +55,55 @@ impl<'a> Iterator for ConvertedStackIter<'a> {
                                 relative_address,
                             )
                         } else {
-                            let relative_address = relative_lookup_address + 1;
-                            Frame::RelativeAddressFromReturnAddress(
+                            Frame::RelativeAddressFromAdjustedReturnAddress(
                                 info.lib_handle,
-                                relative_address,
+                                relative_lookup_address,
                             )
                         };
                         (
                             location,
                             info.category.unwrap_or(self.user_category),
                             info.js_frame,
+                            info.art_info,
                         )
                     }
                     None => {
                         let location = match from_ip {
-                            true => Frame::InstructionPointer(addr),
-                            false => Frame::ReturnAddress(addr),
+                            true => Frame::InstructionPointer(lookup_address),
+                            false => Frame::AdjustedReturnAddress(lookup_address),
                         };
-                        (location, self.user_category, None)
+                        (location, self.user_category, None, None)
                     }
                 },
                 StackMode::Kernel => {
                     let location = match from_ip {
-                        true => Frame::InstructionPointer(addr),
-                        false => Frame::ReturnAddress(addr),
+                        true => Frame::InstructionPointer(lookup_address),
+                        false => Frame::AdjustedReturnAddress(lookup_address),
                     };
-                    (location, self.kernel_category, None)
+                    (location, self.kernel_category, None, None)
                 }
             };
+
+            match art_info {
+                Some(AndroidArtInfo::LibArt) if self.previous_frame_was_dex_or_oat => {
+                    // We want to skip libart frames if they're immediately surrounded by
+                    // dex_or_oat frames on both sides.
+                    if let Some(next_frame) = self.inner.next() {
+                        let should_skip =
+                            StackConverter::frame_is_dex_or_oat(next_frame, self.lib_mappings);
+                        self.pending_frame = Some(next_frame);
+                        if should_skip {
+                            continue; // Skip this libart frame.
+                        }
+                    }
+                    self.previous_frame_was_dex_or_oat = false;
+                }
+                Some(AndroidArtInfo::DexOrOat) => {
+                    self.previous_frame_was_dex_or_oat = true;
+                }
+                _ => self.previous_frame_was_dex_or_oat = false,
+            }
+
             let frame_info = FrameInfo {
                 frame: location,
                 category_pair: category,
@@ -116,7 +138,7 @@ impl<'a> Iterator for ConvertedStackIter<'a> {
             let frame_info = match js_name {
                 Some(JsName::NonSelfHosted(js_name)) => {
                     // Prepend a JS frame.
-                    self.pending_frame = Some(frame_info);
+                    self.pending_frame_info = Some(frame_info);
                     FrameInfo {
                         frame: Frame::Label(js_name),
                         category_pair: category,
@@ -150,8 +172,23 @@ impl StackConverter {
             lib_mappings,
             user_category: self.user_category,
             kernel_category: self.kernel_category,
-            pending_frame: extra_first_frame,
+            pending_frame_info: extra_first_frame,
+            pending_frame: None,
             js_name_for_baseline_interpreter: None,
+            previous_frame_was_dex_or_oat: false,
         }
+    }
+
+    fn frame_is_dex_or_oat(frame: &StackFrame, lib_mappings: &LibMappingsHierarchy) -> bool {
+        let lookup_address = match *frame {
+            StackFrame::InstructionPointer(addr, StackMode::User) => addr,
+            StackFrame::ReturnAddress(addr, StackMode::User) => addr.saturating_sub(1),
+            StackFrame::AdjustedReturnAddress(addr, StackMode::User) => addr,
+            _ => return false,
+        };
+        let Some((_, info)) = lib_mappings.convert_address(lookup_address) else {
+            return false;
+        };
+        info.art_info == Some(AndroidArtInfo::DexOrOat)
     }
 }
